@@ -145,26 +145,17 @@ def process_chunk_phase4(args):
         for res in range(partition_res + 1, 16):
             _assign_cell_to_shortcuts_worker(con, res, "cell_data")
             
-            # Separate active from inactive
-            con.execute("CREATE OR REPLACE TABLE cell_active AS SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell FROM cell_data WHERE current_cell IS NOT NULL")
-            con.execute("CREATE OR REPLACE TABLE cell_inactive AS SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell FROM cell_data WHERE current_cell IS NULL")
-            
-            active_count = con.execute("SELECT count(*) FROM cell_active").fetchone()[0]
-            
             # Determine method for this resolution
             if sp_method == "HYBRID":
                 method = "PURE" if res >= hybrid_res else "SCIPY"
             else:
                 method = sp_method
             
-            # Run SP on active shortcuts
+            # Run SP using _process_cell_backward_worker
+            res_start = time.time()
+            active_count, total_count = _process_cell_backward_worker(con, "cell_data", method=method)
             if active_count > 0:
-                res_start = time.time()
-                _run_shortest_paths_worker(con, "cell_active", method=method)
                 timing_info.append((res, method, time.time() - res_start))
-            
-            # Merge back
-            con.execute("CREATE OR REPLACE TABLE cell_data AS SELECT * FROM cell_active UNION ALL SELECT * FROM cell_inactive")
             
             remaining = con.execute("SELECT count(*) FROM cell_data").fetchone()[0]
             if remaining == 0:
@@ -262,6 +253,48 @@ def _process_cell_forward_worker(con, table_name: str):
     
     con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
     return active_count, new_count
+
+
+def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
+    """
+    Worker version of process_cell_backward.
+    Splits into active/inactive, runs SP only on active, merges back.
+    """
+    # Split: active vs inactive
+    con.execute(f"""
+        CREATE OR REPLACE TABLE shortcuts_active AS
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+        FROM {table_name}
+        WHERE current_cell IS NOT NULL
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE shortcuts_inactive AS
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+        FROM {table_name}
+        WHERE current_cell IS NULL
+    """)
+    
+    active_count = con.execute("SELECT count(*) FROM shortcuts_active").fetchone()[0]
+    
+    if active_count > 0:
+        _run_shortest_paths_worker(con, "shortcuts_active", method=method)
+    
+    # Merge active + inactive back into original table
+    con.execute(f"DROP TABLE IF EXISTS {table_name}")
+    con.execute(f"""
+        CREATE TABLE {table_name} AS
+        SELECT * FROM shortcuts_active
+        UNION ALL
+        SELECT * FROM shortcuts_inactive
+    """)
+    
+    total_count = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+    
+    # Cleanup
+    con.execute("DROP TABLE IF EXISTS shortcuts_active")
+    con.execute("DROP TABLE IF EXISTS shortcuts_inactive")
+    
+    return active_count, total_count
 
 
 def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
@@ -692,25 +725,51 @@ class ParallelShortcutProcessor:
         return active_count, new_count, deactivated_count
 
     def process_cell_backward(self, table_name: str, method: str = SP_METHOD):
-        """Processes shortcuts for backward pass - runs SP on all shortcuts."""
+        """
+        Processes shortcuts for backward pass:
+        1. Split into active (current_cell IS NOT NULL) and inactive (current_cell IS NULL)
+        2. Run SP only on active shortcuts
+        3. Merge back with inactive shortcuts
+        """
+        # Split: active vs inactive
         self.con.execute(f"""
             CREATE OR REPLACE TABLE shortcuts_active AS
             SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
             FROM {table_name}
+            WHERE current_cell IS NOT NULL
         """)
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE shortcuts_inactive AS
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+            FROM {table_name}
+            WHERE current_cell IS NULL
+        """)
+        
         active_count = self.con.sql("SELECT count(*) FROM shortcuts_active").fetchone()[0]
         
         new_count = 0
         if active_count > 0:
-            self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
-            self.con.execute(f"ALTER TABLE shortcuts_active RENAME TO {table_name}")
-            self.run_shortest_paths(method=method, quiet=True, input_table=table_name)
-            new_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
-        else:
-            self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
-            self.con.execute(f"CREATE TABLE {table_name} (from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT, lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, current_cell BIGINT)")
+            # Run SP only on active shortcuts
+            self.run_shortest_paths(method=method, quiet=True, input_table="shortcuts_active")
+            new_count = self.con.sql("SELECT count(*) FROM shortcuts_active").fetchone()[0]
+        
+        # Merge active + inactive back into original table
+        self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        self.con.execute(f"""
+            CREATE TABLE {table_name} AS
+            SELECT * FROM shortcuts_active
+            UNION ALL
+            SELECT * FROM shortcuts_inactive
+        """)
+        
+        total_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+        
+        # Cleanup
+        self.con.execute("DROP TABLE IF EXISTS shortcuts_active")
+        self.con.execute("DROP TABLE IF EXISTS shortcuts_inactive")
             
-        return active_count, new_count, 0
+        return active_count, total_count, 0
+
 
     def run_shortest_paths(self, method: str = None, quiet: bool = True, input_table: str = "shortcuts"):
         """Run shortest paths on input table with slim and enrich optimization."""
