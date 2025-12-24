@@ -21,4 +21,4 @@ algorithm:
 
 # Parallel Execution
 parallel:
-  workers: 10           # 1 = single-threaded, >1 = parallel with N workers
+  workers: 10        # 1 = single-threaded, >1 = parallel with N workers
