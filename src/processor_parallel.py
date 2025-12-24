@@ -70,17 +70,39 @@ def process_chunk_phase1(args):
             
             _assign_cell_to_shortcuts_worker(con, res, "shortcuts")
             
-            # Collect deactivated shortcuts (NULL current_cell) before processing
+            # Expand from current_cell_in/out to current_cell
+            con.execute("""
+                CREATE OR REPLACE TABLE shortcuts_expanded AS
+                -- Inner cell (always include if not null)
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                       inner_res, outer_res, current_cell_in AS current_cell
+                FROM shortcuts
+                WHERE current_cell_in IS NOT NULL
+                UNION
+                -- Outer cell (only if different from inner)
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                       inner_res, outer_res, current_cell_out AS current_cell
+                FROM shortcuts
+                WHERE current_cell_out IS NOT NULL 
+                  AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+                UNION ALL
+                -- Inactive (both NULL)
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                       inner_res, outer_res, NULL AS current_cell
+                FROM shortcuts
+                WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+            """)
+            
+            # Collect deactivated shortcuts (NULL current_cell)
             con.execute("""
                 INSERT INTO deactivated
                 SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell 
-                FROM shortcuts WHERE current_cell IS NULL
+                FROM shortcuts_expanded WHERE current_cell IS NULL
             """)
             
             # Keep only active shortcuts
-            con.execute("CREATE OR REPLACE TABLE shortcuts_active AS SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell FROM shortcuts WHERE current_cell IS NOT NULL")
-            con.execute("DROP TABLE shortcuts")
-            con.execute("ALTER TABLE shortcuts_active RENAME TO shortcuts")
+            con.execute("CREATE OR REPLACE TABLE shortcuts AS SELECT * FROM shortcuts_expanded WHERE current_cell IS NOT NULL")
+            con.execute("DROP TABLE IF EXISTS shortcuts_expanded")
             
             active_count = con.execute("SELECT count(*) FROM shortcuts").fetchone()[0]
             
@@ -176,53 +198,36 @@ def process_chunk_phase4(args):
 
 
 def _assign_cell_to_shortcuts_worker(con, res: int, input_table: str):
-    """Worker version of assign_cell_to_shortcuts."""
+    """
+    Worker version of assign_cell_to_shortcuts.
+    Adds current_cell_in and current_cell_out columns instead of creating UNION.
+    """
     con.execute(f"DROP TABLE IF EXISTS {input_table}_tmp")
     
     if res == -1:
+        # Global level: all shortcuts belong to cell 0
         con.execute(f"""
             CREATE TABLE {input_table}_tmp AS
             SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, 0::BIGINT AS current_cell
+                   inner_res, outer_res, 
+                   0::BIGINT AS current_cell_in, 
+                   0::BIGINT AS current_cell_out
             FROM {input_table}
         """)
     else:
+        # Compute parent cells for inner and outer, store as separate columns
         con.execute(f"""
             CREATE TABLE {input_table}_tmp AS
-            WITH with_parents AS (
-                SELECT 
-                    from_edge, to_edge, cost, via_edge, lca_res, 
-                    inner_cell, outer_cell, inner_res, outer_res,
-                    CASE WHEN inner_res >= {res} 
-                         THEN h3_parent(inner_cell::BIGINT, {res}) 
-                         ELSE NULL END AS inner_parent,
-                    CASE WHEN outer_res >= {res} 
-                         THEN h3_parent(outer_cell::BIGINT, {res}) 
-                         ELSE NULL END AS outer_parent
-                FROM {input_table}
-            )
-            -- 1. Inner Parent (Active)
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, inner_parent AS current_cell
-            FROM with_parents 
-            WHERE lca_res <= {res} AND inner_parent IS NOT NULL
-            
-            UNION
-            
-            -- 2. Outer Parent (Active)
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, outer_parent AS current_cell
-            FROM with_parents 
-            WHERE lca_res <= {res} AND outer_parent IS NOT NULL
-            
-            UNION ALL
-            
-            -- 3. Inactive or Not Yet Active
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, NULL AS current_cell
-            FROM with_parents 
-            WHERE lca_res > {res} 
-               OR (inner_parent IS NULL AND outer_parent IS NULL)
+            SELECT 
+                from_edge, to_edge, cost, via_edge, lca_res, 
+                inner_cell, outer_cell, inner_res, outer_res,
+                CASE WHEN lca_res <= {res} AND inner_res >= {res} 
+                     THEN h3_parent(inner_cell::BIGINT, {res}) 
+                     ELSE NULL END AS current_cell_in,
+                CASE WHEN lca_res <= {res} AND outer_res >= {res} 
+                     THEN h3_parent(outer_cell::BIGINT, {res}) 
+                     ELSE NULL END AS current_cell_out
+            FROM {input_table}
         """)
     
     con.execute(f"DROP TABLE {input_table}")
@@ -230,11 +235,38 @@ def _assign_cell_to_shortcuts_worker(con, res: int, input_table: str):
 
 
 def _process_cell_forward_worker(con, table_name: str):
-    """Worker version of process_cell_forward."""
-    # Separate active and deactivated
+    """
+    Worker version of process_cell_forward.
+    Expands current_cell_in/out to single current_cell column first.
+    """
+    # Step 1: Expand from current_cell_in/out to current_cell
+    con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+    con.execute(f"""
+        CREATE TABLE {table_name}_expanded AS
+        -- Inner cell (always include if not null)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_in AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NOT NULL
+        UNION
+        -- Outer cell (only if different from inner)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_out AS current_cell
+        FROM {table_name}
+        WHERE current_cell_out IS NOT NULL 
+          AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+        UNION ALL
+        -- Inactive (both NULL)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, NULL AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+    """)
+    
+    # Step 2: Separate active and deactivated
     con.execute(f"""
         CREATE OR REPLACE TABLE shortcuts_to_process AS
-        SELECT * FROM {table_name} WHERE current_cell IS NOT NULL
+        SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL
     """)
     
     active_count = con.execute("SELECT count(*) FROM shortcuts_to_process").fetchone()[0]
@@ -245,10 +277,13 @@ def _process_cell_forward_worker(con, table_name: str):
         
         # Replace original table
         con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
         con.execute(f"ALTER TABLE shortcuts_to_process RENAME TO {table_name}")
         new_count = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
     else:
-        con.execute(f"DELETE FROM {table_name}")
+        con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+        con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM shortcuts_to_process WHERE 1=0")
         new_count = 0
     
     con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
@@ -258,20 +293,41 @@ def _process_cell_forward_worker(con, table_name: str):
 def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
     """
     Worker version of process_cell_backward.
-    Splits into active/inactive, runs SP only on active, merges back.
+    Expands current_cell_in/out to single current_cell, then splits active/inactive, 
+    runs SP only on active, merges back.
     """
-    # Split: active vs inactive
+    # Step 1: Expand from current_cell_in/out to current_cell
+    con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+    con.execute(f"""
+        CREATE TABLE {table_name}_expanded AS
+        -- Inner cell (always include if not null)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_in AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NOT NULL
+        UNION
+        -- Outer cell (only if different from inner)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_out AS current_cell
+        FROM {table_name}
+        WHERE current_cell_out IS NOT NULL 
+          AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+        UNION ALL
+        -- Inactive (both NULL)
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, NULL AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+    """)
+    
+    # Step 2: Split active vs inactive
     con.execute(f"""
         CREATE OR REPLACE TABLE shortcuts_active AS
-        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
-        FROM {table_name}
-        WHERE current_cell IS NOT NULL
+        SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL
     """)
     con.execute(f"""
         CREATE OR REPLACE TABLE shortcuts_inactive AS
-        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
-        FROM {table_name}
-        WHERE current_cell IS NULL
+        SELECT * FROM {table_name}_expanded WHERE current_cell IS NULL
     """)
     
     active_count = con.execute("SELECT count(*) FROM shortcuts_active").fetchone()[0]
@@ -281,6 +337,7 @@ def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
     
     # Merge active + inactive back into original table
     con.execute(f"DROP TABLE IF EXISTS {table_name}")
+    con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
     con.execute(f"""
         CREATE TABLE {table_name} AS
         SELECT * FROM shortcuts_active
@@ -597,42 +654,35 @@ class ParallelShortcutProcessor:
     def assign_cell_to_shortcuts(self, res: int, phase: int = 1, direction: str = "forward", input_table: str = "shortcuts", single_assignment: bool = False):
         """
         Assigns each shortcut to H3 cell(s) at resolution res.
+        Instead of creating UNION (row duplication), adds current_cell_in and current_cell_out columns.
+        Row expansion is deferred to process_cell_forward/backward.
         """
         self.con.execute(f"DROP TABLE IF EXISTS {input_table}_tmp")
         
         if res == -1:
+            # Global level: all shortcuts belong to cell 0
             self.con.execute(f"""
                 CREATE TABLE {input_table}_tmp AS
                 SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell,
-                       inner_res, outer_res, 0::BIGINT AS current_cell
+                       inner_res, outer_res, 
+                       0::BIGINT AS current_cell_in, 
+                       0::BIGINT AS current_cell_out
                 FROM {input_table}
             """)
         else:
+            # Compute parent cells for inner and outer, store as separate columns
             self.con.execute(f"""
                 CREATE TABLE {input_table}_tmp AS
-                WITH with_parents AS (
-                    SELECT 
-                        from_edge, to_edge, cost, via_edge, lca_res, 
-                        inner_cell, outer_cell, inner_res, outer_res,
-                        CASE WHEN inner_res >= {res} THEN h3_parent(inner_cell::BIGINT, {res}) ELSE NULL END AS inner_parent,
-                        CASE WHEN outer_res >= {res} THEN h3_parent(outer_cell::BIGINT, {res}) ELSE NULL END AS outer_parent
-                    FROM {input_table}
-                )
-                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                       inner_res, outer_res, inner_parent AS current_cell
-                FROM with_parents 
-                WHERE lca_res <= {res} AND inner_parent IS NOT NULL
-                UNION
-                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                       inner_res, outer_res, outer_parent AS current_cell
-                FROM with_parents 
-                WHERE lca_res <= {res} AND outer_parent IS NOT NULL
-                UNION ALL
-                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                       inner_res, outer_res, NULL AS current_cell
-                FROM with_parents 
-                WHERE lca_res > {res} 
-                   OR (inner_parent IS NULL AND outer_parent IS NULL)
+                SELECT 
+                    from_edge, to_edge, cost, via_edge, lca_res, 
+                    inner_cell, outer_cell, inner_res, outer_res,
+                    CASE WHEN lca_res <= {res} AND inner_res >= {res} 
+                         THEN h3_parent(inner_cell::BIGINT, {res}) 
+                         ELSE NULL END AS current_cell_in,
+                    CASE WHEN lca_res <= {res} AND outer_res >= {res} 
+                         THEN h3_parent(outer_cell::BIGINT, {res}) 
+                         ELSE NULL END AS current_cell_out
+                FROM {input_table}
             """)
         
         self.con.execute(f"DROP TABLE {input_table}")
@@ -696,16 +746,44 @@ class ParallelShortcutProcessor:
         self.con.execute("DROP TABLE IF EXISTS _child_cells")
 
     def process_cell_forward(self, table_name: str, method: str = SP_METHOD):
-        """Processes shortcuts for forward pass with deactivation."""
+        """
+        Processes shortcuts for forward pass with deactivation.
+        Expands current_cell_in/out to single current_cell column first.
+        """
+        # Step 1: Expand from current_cell_in/out to current_cell
+        self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+        self.con.execute(f"""
+            CREATE TABLE {table_name}_expanded AS
+            -- Inner cell (always include if not null)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, current_cell_in AS current_cell
+            FROM {table_name}
+            WHERE current_cell_in IS NOT NULL
+            UNION
+            -- Outer cell (only if different from inner)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, current_cell_out AS current_cell
+            FROM {table_name}
+            WHERE current_cell_out IS NOT NULL 
+              AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+            UNION ALL
+            -- Inactive (both NULL)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, NULL AS current_cell
+            FROM {table_name}
+            WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+        """)
+        
+        # Step 2: Separate active and deactivated
         self.con.execute(f"DROP TABLE IF EXISTS shortcuts_to_process")
-        self.con.execute(f"CREATE TEMPORARY TABLE shortcuts_to_process AS SELECT * FROM {table_name} WHERE current_cell IS NOT NULL")
+        self.con.execute(f"CREATE TEMPORARY TABLE shortcuts_to_process AS SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL")
         
         self.con.execute(f"""
             INSERT INTO {self.forward_deactivated_table}
             SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
-            FROM {table_name} WHERE current_cell IS NULL
+            FROM {table_name}_expanded WHERE current_cell IS NULL
         """)
-        deactivated_count = self.con.sql(f"SELECT count(*) FROM {table_name} WHERE current_cell IS NULL").fetchone()[0]
+        deactivated_count = self.con.sql(f"SELECT count(*) FROM {table_name}_expanded WHERE current_cell IS NULL").fetchone()[0]
         
         active_count = self.con.sql("SELECT count(*) FROM shortcuts_to_process").fetchone()[0]
         
@@ -713,10 +791,13 @@ class ParallelShortcutProcessor:
         if active_count > 0:
             self.run_shortest_paths(method=method, quiet=True, input_table="shortcuts_to_process")
             self.con.execute(f"DROP TABLE {table_name}")
+            self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
             self.con.execute(f"ALTER TABLE shortcuts_to_process RENAME TO {table_name}")
             new_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
         else:
-            self.con.execute(f"DELETE FROM {table_name}")
+            self.con.execute(f"DROP TABLE {table_name}")
+            self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+            self.con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM shortcuts_to_process WHERE 1=0")
             new_count = 0
             
         self.con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
@@ -727,22 +808,43 @@ class ParallelShortcutProcessor:
     def process_cell_backward(self, table_name: str, method: str = SP_METHOD):
         """
         Processes shortcuts for backward pass:
-        1. Split into active (current_cell IS NOT NULL) and inactive (current_cell IS NULL)
-        2. Run SP only on active shortcuts
-        3. Merge back with inactive shortcuts
+        1. Expand from current_cell_in/out to current_cell
+        2. Split into active (current_cell IS NOT NULL) and inactive (current_cell IS NULL)
+        3. Run SP only on active shortcuts
+        4. Merge back with inactive shortcuts
         """
-        # Split: active vs inactive
+        # Step 1: Expand from current_cell_in/out to current_cell
+        self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+        self.con.execute(f"""
+            CREATE TABLE {table_name}_expanded AS
+            -- Inner cell (always include if not null)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, current_cell_in AS current_cell
+            FROM {table_name}
+            WHERE current_cell_in IS NOT NULL
+            UNION
+            -- Outer cell (only if different from inner)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, current_cell_out AS current_cell
+            FROM {table_name}
+            WHERE current_cell_out IS NOT NULL 
+              AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+            UNION ALL
+            -- Inactive (both NULL)
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res, NULL AS current_cell
+            FROM {table_name}
+            WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+        """)
+        
+        # Step 2: Split active vs inactive
         self.con.execute(f"""
             CREATE OR REPLACE TABLE shortcuts_active AS
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
-            FROM {table_name}
-            WHERE current_cell IS NOT NULL
+            SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL
         """)
         self.con.execute(f"""
             CREATE OR REPLACE TABLE shortcuts_inactive AS
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
-            FROM {table_name}
-            WHERE current_cell IS NULL
+            SELECT * FROM {table_name}_expanded WHERE current_cell IS NULL
         """)
         
         active_count = self.con.sql("SELECT count(*) FROM shortcuts_active").fetchone()[0]
@@ -755,6 +857,7 @@ class ParallelShortcutProcessor:
         
         # Merge active + inactive back into original table
         self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
         self.con.execute(f"""
             CREATE TABLE {table_name} AS
             SELECT * FROM shortcuts_active
