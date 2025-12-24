@@ -988,29 +988,12 @@ class ParallelShortcutProcessor:
                     self.assign_cell_to_shortcuts(child_res, input_table=f"cell_{child_id}")
                     t_assign = time.time() - t_assign
                     
-                    # Split active/inactive, run SP on active, merge back
-                    self.con.execute(f"CREATE OR REPLACE TABLE cell_{child_id}_active AS SELECT * FROM cell_{child_id} WHERE current_cell IS NOT NULL")
-                    self.con.execute(f"CREATE OR REPLACE TABLE cell_{child_id}_inactive AS SELECT * FROM cell_{child_id} WHERE current_cell IS NULL")
+                    # Use process_cell_backward to split active/inactive, run SP, merge back
+                    t_sp = time.time()
+                    method = self.get_sp_method_for_resolution(child_res, is_forward=False)
+                    active_count, news, _ = self.process_cell_backward(f"cell_{child_id}", method=method)
+                    t_sp = time.time() - t_sp
                     
-                    active_count = self.con.sql(f"SELECT count(*) FROM cell_{child_id}_active").fetchone()[0]
-                    
-                    t_sp = 0
-                    if active_count > 0:
-                        t_sp = time.time()
-                        method = self.get_sp_method_for_resolution(child_res, is_forward=True)
-                        self.run_shortest_paths(method=method, input_table=f"cell_{child_id}_active")
-                        t_sp = time.time() - t_sp
-                      
-                    self.con.execute(f"""
-                        CREATE OR REPLACE TABLE cell_{child_id} AS
-                        SELECT * FROM cell_{child_id}_active
-                        UNION ALL
-                        SELECT * FROM cell_{child_id}_inactive
-                    """)
-                    self.con.execute(f"DROP TABLE IF EXISTS cell_{child_id}_active")
-                    self.con.execute(f"DROP TABLE IF EXISTS cell_{child_id}_inactive")
-                    
-                    news = self.con.sql(f"SELECT count(*) FROM cell_{child_id}").fetchone()[0]
                     logger.info(f"      Cell {child_id}: {child_count} -> {news} [assign={t_assign:.2f}s, partition={t_partition:.2f}s, SP={t_sp:.2f}s]")
                     
                 self.con.execute("DROP TABLE IF EXISTS current_splits")
