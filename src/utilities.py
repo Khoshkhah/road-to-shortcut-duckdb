@@ -1,23 +1,26 @@
 
+import os
 import duckdb
 import h3
 from pathlib import Path
-import config
+
 
 def initialize_duckdb(db_path: str = ":memory:") -> duckdb.DuckDBPyConnection:
     """Initialize DuckDB connection and register UDFs."""
     con = duckdb.connect(db_path)
     
-    # Enforce memory limit if configured
-    if config.DUCKDB_MEMORY_LIMIT:
-        con.execute(f"SET memory_limit='{config.DUCKDB_MEMORY_LIMIT}'")
+    # Enforce memory limit if configured via environment variable
+    memory_limit = os.environ.get("DUCKDB_MEMORY_LIMIT")
+    if memory_limit:
+        con.execute(f"SET memory_limit='{memory_limit}'")
     
     # Tuning for performance/memory
     con.execute("SET preserve_insertion_order=false")
     
     # Set temp directory for spilling if persistence is enabled
-    if config.DUCKDB_PERSIST_DIR:
-        temp_dir = Path(config.DUCKDB_PERSIST_DIR) / "temp"
+    persist_dir = os.environ.get("DUCKDB_PERSIST_DIR")
+    if persist_dir:
+        temp_dir = Path(persist_dir) / "temp"
         temp_dir.mkdir(exist_ok=True)
         con.execute(f"SET temp_directory='{temp_dir}'")
     

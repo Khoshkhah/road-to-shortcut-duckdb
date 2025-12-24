@@ -3,14 +3,26 @@ import logging
 import time
 from pathlib import Path
 
-def setup_logging(name: str = None) -> logging.Logger:
+# Global verbose flag (can be set by main.py)
+VERBOSE = True
+
+def setup_logging(name: str = None, level: str = "INFO", verbose: bool = True) -> logging.Logger:
     """
     Setup logging to file and console.
     Logs are saved in 'logs/' directory with timestamp.
     Configures the ROOT logger so all modules log to the file.
+    
+    Args:
+        name: Log file name prefix
+        level: Log level (DEBUG, INFO, WARNING, ERROR)
+        verbose: If False, suppresses per-item detail logs
     """
+    global VERBOSE
+    VERBOSE = verbose
+    
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    root_logger.setLevel(log_level)
     
     # Avoid adding handlers multiple times
     if root_logger.hasHandlers():

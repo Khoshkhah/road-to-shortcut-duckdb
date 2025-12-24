@@ -5,10 +5,9 @@ import duckdb
 import h3
 import pandas as pd
 
-import config
 import utilities as utils
-from generate_shortcuts_pure import compute_shortest_paths_pure_duckdb, compute_shortest_paths_grouped
-from generate_shortcuts_scipy import process_partition_scipy
+from sp_methods.pure import compute_shortest_paths_pure_duckdb
+from sp_methods.scipy import process_partition_scipy
 
 import logging_config as log_conf
 
@@ -16,21 +15,25 @@ logger = logging.getLogger(__name__)
 
 PARTITION_RES = 7
 
-# SP Method: "PURE" | "SCIPY" (applies to both phases)
+import os
+#SP_METHOD = os.environ.get("SP_METHOD", "SCIPY")
 SP_METHOD = "SCIPY"
 
 
 
 
 
-
 class ShortcutProcessor:
-    def __init__(self, db_path: str, forward_deactivated_table: str, backward_deactivated_table: str, partition_res: int = PARTITION_RES, elementary_table: str = "elementary_table"):
+    def __init__(self, db_path: str, forward_deactivated_table: str, backward_deactivated_table: str, 
+                 partition_res: int = PARTITION_RES, elementary_table: str = "elementary_table",
+                 sp_method: str = None, hybrid_res: int = 10):
         self.con = utils.initialize_duckdb(db_path)
         self.forward_deactivated_table = forward_deactivated_table
         self.backward_deactivated_table = backward_deactivated_table
         self.partition_res = partition_res
         self.elementary_table = elementary_table
+        self.sp_method = sp_method or SP_METHOD  # Use global if not specified
+        self.hybrid_res = hybrid_res
         self.current_cells = []  # Tracks active cell IDs across phases
         # Ensure deactivated table exists (with full H3 schema)
         self.con.execute(f"""
@@ -63,6 +66,29 @@ class ShortcutProcessor:
                 lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
             )
         """)
+
+    def get_sp_method_for_resolution(self, res: int, is_forward: bool) -> str:
+        """
+        Determine which SP method to use based on resolution and phase direction.
+        
+        For HYBRID mode:
+          - Phase 1 (forward, 15 -> partition_res): 
+            - res >= hybrid_res: PURE
+            - res < hybrid_res: SCIPY
+          - Phase 4 (backward, partition_res+1 -> 15):
+            - res < hybrid_res: SCIPY
+            - res >= hybrid_res: PURE
+            
+        For PURE or SCIPY modes, always return that method.
+        """
+        if self.sp_method == "HYBRID":
+            if res >= self.hybrid_res:
+                return "PURE"
+            else:
+                return "SCIPY"
+        else:
+            return self.sp_method
+
 
     def load_shared_data(self, edges_file: str, graph_file: str):
         """Loads edges and initial shortcuts into the database."""
@@ -113,6 +139,7 @@ class ShortcutProcessor:
         4. Run iterative resolution loop (15 -> partition_res).
         5. Save per-cell tables.
         """
+        log_conf.log_section(logger, f"PHASE 1: FORWARD PASS (15 -> {self.partition_res})")
         if source_table is None:
             source_table = self.elementary_table
 
@@ -135,7 +162,7 @@ class ShortcutProcessor:
         for i, chunk_id in enumerate(chunk_ids, 1):
             # 1. Get initial shortcuts relevant to this chunk using pre-calculated cells
             self.con.execute(f"""
-                CREATE OR REPLACE TABLE shortcuts AS
+                CREATE OR REPLACE TABLE cell_{chunk_id} AS
                 SELECT *
                 FROM {source_table}
                 WHERE h3_parent(inner_cell, {self.partition_res}) = {chunk_id}
@@ -143,35 +170,42 @@ class ShortcutProcessor:
             """)
             
             # 2. Iterative Forward Pass
+            import time as time_module
             for res in range(15, self.partition_res - 1, -1):
-                self.assign_cell_to_shortcuts(res, input_table="shortcuts")
-                active, news, decs = self.process_cell_forward("shortcuts")
-                logger.debug(f"      Res {res}: {active} active, {news} pool")
+                res_start = time_module.time()
+                self.assign_cell_to_shortcuts(res, input_table=f"cell_{chunk_id}")
+                method = self.get_sp_method_for_resolution(res, is_forward=True)
+                active, news, decs = self.process_cell_forward(f"cell_{chunk_id}", method=method)
+                res_time = time_module.time() - res_start
+                if self.sp_method == "HYBRID":
+                    logger.info(f"        Res {res} ({method}): {active}->{news} [{res_time:.2f}s]")
                 if active == 0:
                     break
             
             # 3. Save results to per-cell table (Carry all 8 columns)
-            chunk_count = self.con.sql("SELECT count(*) FROM shortcuts").fetchone()[0]
+            chunk_count = self.con.sql(f"SELECT count(*) FROM cell_{chunk_id}").fetchone()[0]
             if chunk_count > 0:
-                self.con.execute(f"""
-                    CREATE OR REPLACE TABLE cell_{chunk_id} AS
-                    SELECT * FROM shortcuts
-                """)
                 res_partition_cells.append(chunk_id)
                 logger.info(f"  [{i}/{len(chunk_ids)}] Chunk {chunk_id} complete. {chunk_count} shortcuts in pool")
             else:
                 logger.info(f"  [{i}/{len(chunk_ids)}] Chunk {chunk_id} complete. 0 shortcuts (all deactivated)")
             
         self.current_cells = res_partition_cells
+        
+        # Phase 1 summary
+        logger.info("--------------------------------------------------")
+        total_in_pool = sum(self.con.sql(f"SELECT count(*) FROM cell_{cid}").fetchone()[0] for cid in res_partition_cells)
+        total_deactivated = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
+        logger.info(f"  Summary: {len(res_partition_cells)} cells, {total_in_pool} in pool, {total_deactivated} deactivated")
+        
         return res_partition_cells
 
     def process_forward_phase2_consolidation(self):
         """
-        Processes the Hierarchical Consolidation (Phase 2):
-        1. Loop target_res from partition_res-1 down to -1.
-        2. Group cells by parent.
-        3. UNION children, process, and save parent.
+        Phase 2: Hierarchical Consolidation (Forward Pass)
+        Merges cells upward level by level from partition_res-1 to 0.
         """
+        log_conf.log_section(logger, f"PHASE 2: HIERARCHICAL CONSOLIDATION ({self.partition_res-1} -> 0)")
         logger.info(f"  Starting Phase 2 with {len(self.current_cells)} cell tables.")
 
         for target_res in range(self.partition_res - 1, -2, -1):
@@ -204,6 +238,10 @@ class ShortcutProcessor:
                 # 1. Merge children shortcuts (Carry all 8 columns and deduplicate)
                 # If parent_id is in valid_children, we must avoid DROP TABLE collision
                 # Solution: Create to a TEMP name first
+                #-------------------------------------------------------------
+                # warning: need to edit: current_cell column does not need to be in the group by
+                #               also we can drop this column
+                #-------------------------------------------------------------
                 merge_sql = " UNION ALL ".join([f"SELECT * FROM cell_{child}" for child in valid_children])
                 self.con.execute(f"""
                     CREATE OR REPLACE TABLE cell_{parent_id}_tmp AS
@@ -268,7 +306,8 @@ class ShortcutProcessor:
         self.con.execute(f"ALTER TABLE {self.forward_deactivated_table}_dedup RENAME TO {self.forward_deactivated_table}")
         dedup_count = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
         
-        log_conf.log_section(logger, "PHASE 2 COMPLETE - FORWARD PASS METRICS")
+        #log_conf.log_section(logger, "PHASE 2 COMPLETE - FORWARD PASS METRICS")
+        logger.info("--------------------------------------------------")
         logger.info(f"  Remaining active at Res -1: {remaining_active}")
         logger.info(f"  Total deactivated (before dedup): {total_forward}")  
         logger.info(f"  Deduplicated forward results: {dedup_count}")
@@ -277,13 +316,14 @@ class ShortcutProcessor:
 
     def process_backward_phase3_consolidation(self):
         """
-        Processes the Backward Consolidation (Phase 3):
-        Parent-to-children splitting (coarse to fine, ASCENDING resolution).
-        1. Start at resolution 0 with all shortcuts as one global cell.
-        2. Run SP on all shortcuts.
-        3. Assign/split to child cells at resolution 1.
-        4. Repeat until partition_res.
+        Phase 3: Backward Consolidation (Down from low to partition_res)
+        Splits cells downward level by level from 0 (or lowest active) back to partition_res.
         """
+        log_conf.log_section(logger, f"PHASE 3: BACKWARD CONSOLIDATION (0 -> {self.partition_res})")
+        if not self.current_cells:
+            logger.warning("No cells to process in Phase 3.")
+            return
+
         # Start with forward pass results as shortcuts table (already deduplicated)
         self.con.execute(f"""
             CREATE OR REPLACE TABLE shortcuts AS
@@ -386,7 +426,8 @@ class ShortcutProcessor:
                     t_sp = 0
                     if active_count > 0 and not skip_sp:
                         t_sp = time.time()
-                        self.run_shortest_paths(input_table=f"cell_{child_id}_active")
+                        method = self.get_sp_method_for_resolution(child_res, is_forward=True)
+                        self.run_shortest_paths(method=method, input_table=f"cell_{child_id}_active")
                         t_sp = time.time() - t_sp
                       
                     # Merge SP results with inactive shortcuts back into child table
@@ -404,9 +445,9 @@ class ShortcutProcessor:
               
                     total_time = time.time() - child_start
                     if skip_sp:
-                        logger.info(f"      Cell {child_id}: {child_count} -> {news} (SP skipped) [assign={t_assign:.2f}s, partition={t_partition:.2f}s, total={total_time:.2f}s]")
+                        logger.info(f"      Cell {child_id}: {child_count} -> {news} (SP skipped) [assign={t_assign:.2f}s, partition={t_partition:.2f}s]")
                     else:
-                        logger.info(f"      Cell {child_id}: {child_count} -> {news} [assign={t_assign:.2f}s, partition={t_partition:.2f}s, SP={t_sp:.2f}s, total={total_time:.2f}s]")
+                        logger.info(f"      Cell {child_id}: {child_count} -> {news} [assign={t_assign:.2f}s, partition={t_partition:.2f}s, SP={t_sp:.2f}s]")
                     
                 
                 self.con.execute("DROP TABLE IF EXISTS current_splits")
@@ -420,6 +461,9 @@ class ShortcutProcessor:
                 
                 list_children_cells += list(active_children)
             self.current_cells = list_children_cells
+            
+            # Memory management: vacuum every resolution to reclaim space from dropped tables
+            self.vacuum()
             logger.info(f"  Res {target_res} -> {child_res} complete in {format_time(time.time() - res_start)}. Active cells: {len(list_children_cells)}, Deactivated so far: {self.con.sql(f'SELECT count(*) FROM {self.backward_deactivated_table}').fetchone()[0]}")
 
         # Phase 3 complete - remaining cells stay active for Phase 4
@@ -428,17 +472,17 @@ class ShortcutProcessor:
             for cell_id in self.current_cells
         )
         total_backward = self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
-        logger.info(f"  Phase 3 complete. {len(self.current_cells)} cells ({remaining_active} shortcuts) remain for Phase 4. Deactivated: {total_backward}")
+        logger.info("--------------------------------------------------")
+        logger.info(f"  Summary: {len(self.current_cells)} cells ({remaining_active} shortcuts) remain for Phase 4. Deactivated: {total_backward}")
         
         return total_backward
 
     def process_backward_phase4_chunked(self):
         """
-        Processes the Backward Chunked (Phase 4):
-        Continues from Phase 3's current_cells (already at partition_res).
-        For each cell, run iterative backward loop from partition_res to 16.
-        All results go to backward_deactivated (same table as Phase 3).
+        Phase 4: Process each partition-res cell upward individually.
+        For each cell: iterative loop from partition_res+1 -> 15.
         """
+        log_conf.log_section(logger, f"PHASE 4: BACKWARD CHUNKED ({self.partition_res+1} -> 15)")
         # Use current_cells from Phase 3 (already at partition_res)
         cell_ids = self.current_cells
         total_shortcuts = sum(
@@ -481,7 +525,8 @@ class ShortcutProcessor:
                 
                 # 3. Run SP on active shortcuts
                 if active_count > 0:
-                    self.run_shortest_paths(input_table=f"{cell_table}_active")
+                    method = self.get_sp_method_for_resolution(res, is_forward=False)
+                    self.run_shortest_paths(method=method, input_table=f"{cell_table}_active")
                 
                 # 4. Merge SP results with inactive back into cell table
                 self.con.execute(f"""
@@ -520,7 +565,11 @@ class ShortcutProcessor:
         self.con.execute("DROP TABLE IF EXISTS shortcuts_next")
         self.con.execute("DROP TABLE IF EXISTS shortcuts_active")
         
-        return self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
+        # Phase 4 summary
+        final_count = self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
+        logger.info(f"  Summary: {final_count} total shortcuts in backward_deactivated")
+        
+        return final_count
 
     def finalize_and_save(self, output_path: str):
         """Deduplicates backward pass results and saves output."""
@@ -716,8 +765,14 @@ class ShortcutProcessor:
             self.con.execute(f"DROP TABLE {table_name}")
             self.con.execute(f"ALTER TABLE shortcuts_to_process RENAME TO {table_name}")
             new_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+            #-----------------------------------------------------
+            # warning : there is a bug in the code that the values of new_count is less than active_count for small values of active_count
+            #-----------------------------------------------------
+            if new_count < active_count:
+                logger.info(f"New pool size: {new_count} and active count: {active_count}")
         else:
             # No active shortcuts, empty the pool
+            #logger.info(f"No active shortcuts in {table_name}, emptying pool")
             self.con.execute(f"DELETE FROM {table_name}")
             new_count = 0
             
@@ -777,6 +832,8 @@ class ShortcutProcessor:
         # 2. Run SP Algorithm on sp_input
         if method == "PURE":
             compute_shortest_paths_pure_duckdb(self.con, quiet=quiet, input_table="sp_input")
+            # PURE method modifies sp_input in-place, create shortcuts_next from it
+            self.con.execute("CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input")
             
         elif method == "SCIPY":
             df = self.con.sql("SELECT * FROM sp_input").df()
@@ -797,7 +854,8 @@ class ShortcutProcessor:
                 self.con.execute(f"CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input WHERE 1=0")
 
         # 3. RE-ENRICH: Calculate metadata columns for all shortcuts
-        if self.con.sql("SELECT count(*) FROM information_schema.tables WHERE table_name = 'shortcuts_next'").fetchone()[0] > 0:
+        table_exists = self.con.sql("SELECT count(*) FROM information_schema.tables WHERE table_name = 'shortcuts_next'").fetchone()[0] > 0
+        if table_exists:
             self.con.execute("""
                 CREATE OR REPLACE TABLE shortcuts_next_enriched AS
                 SELECT 
@@ -814,6 +872,15 @@ class ShortcutProcessor:
             """)
             self.con.execute("DROP TABLE shortcuts_next")
             self.con.execute("ALTER TABLE shortcuts_next_enriched RENAME TO shortcuts_next")
+        else:
+            # Fallback: create empty shortcuts_next with correct schema if it doesn't exist
+            self.con.execute(f"""
+                CREATE OR REPLACE TABLE shortcuts_next AS 
+                SELECT from_edge, to_edge, cost, via_edge, 
+                       0 as lca_res, 0::BIGINT as inner_cell, 0::BIGINT as outer_cell, 
+                       0::TINYINT as inner_res, 0::TINYINT as outer_res, 0::BIGINT as current_cell
+                FROM {input_table} WHERE 1=0
+            """)
 
         # Replace input_table with result
         self.con.execute(f"DROP TABLE IF EXISTS {input_table}")
