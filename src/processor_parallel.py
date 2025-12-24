@@ -161,10 +161,41 @@ def process_chunk_phase4(args):
         # Load cell data
         con.execute("CREATE TABLE cell_data AS SELECT * FROM cell_df")
         
+        # Create table to collect deactivated shortcuts
+        con.execute("""
+            CREATE TABLE deactivated (
+                from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
+                lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
+                inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
+            )
+        """)
+        
         initial_count = len(cell_df)
         
         # Iterative backward loop: partition_res+1 -> 15
         for res in range(partition_res + 1, 16):
+            # First: Deactivate shortcuts where res > max(inner_res, outer_res)
+            # These shortcuts have reached their finest granularity
+            con.execute(f"""
+                INSERT INTO deactivated
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                       inner_res, outer_res, NULL::BIGINT AS current_cell
+                FROM cell_data
+                WHERE {res} > GREATEST(inner_res, outer_res)
+            """)
+            
+            # Keep only shortcuts that can still be refined
+            con.execute(f"""
+                CREATE OR REPLACE TABLE cell_data AS
+                SELECT * FROM cell_data
+                WHERE {res} <= GREATEST(inner_res, outer_res)
+            """)
+            
+            remaining = con.execute("SELECT count(*) FROM cell_data").fetchone()[0]
+            if remaining == 0:
+                break
+            
+            # Then: Assign cells and process
             _assign_cell_to_shortcuts_worker(con, res, "cell_data")
             
             # Determine method for this resolution
@@ -178,13 +209,15 @@ def process_chunk_phase4(args):
             active_count, total_count = _process_cell_backward_worker(con, "cell_data", method=method)
             if active_count > 0:
                 timing_info.append((res, method, time.time() - res_start))
-            
-            remaining = con.execute("SELECT count(*) FROM cell_data").fetchone()[0]
-            if remaining == 0:
-                break
         
-        # Get final result
-        result_df = con.execute("SELECT * FROM cell_data").df()
+        # Add any remaining shortcuts to deactivated (at res 15)
+        con.execute("""
+            INSERT INTO deactivated
+            SELECT * FROM cell_data
+        """)
+        
+        # Get final result - all deactivated shortcuts
+        result_df = con.execute("SELECT * FROM deactivated").df()
         final_count = len(result_df)
         
         return (cell_id, result_df, final_count, timing_info)
