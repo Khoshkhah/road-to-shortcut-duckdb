@@ -151,10 +151,9 @@ def run_partitioned_parallel(cfg):
     import logging
     import logging_config as log_conf
     from processor_parallel import ParallelShortcutProcessor, MAX_WORKERS
-    from processor import ShortcutProcessor
     
     logger = logging.getLogger(__name__)
-    log_conf.setup_logging(f"parallel_{cfg.input.district}", level=cfg.logging.level, verbose=cfg.logging.verbose)
+    log_conf.setup_logging(f"{cfg.input.district}", level=cfg.logging.level, verbose=cfg.logging.verbose)
     
     # Log config info at start
     log_conf.log_section(logger, "CONFIGURATION")
@@ -172,7 +171,7 @@ def run_partitioned_parallel(cfg):
     # Setup paths
     persist_dir = Path(cfg.output.persist_dir)
     persist_dir.mkdir(parents=True, exist_ok=True)
-    db_path = str(persist_dir / f"{cfg.input.district}_parallel.db")
+    db_path = str(persist_dir / f"{cfg.input.district}.db")
     
     # Delete existing DB if fresh_start is enabled
     if cfg.duckdb.fresh_start:
@@ -225,44 +224,16 @@ def run_partitioned_parallel(cfg):
         logger.info(f"Phase 1 complete ({format_time(time.time() - phase1_start)}). Created {len(res_partition_cells)} cell tables.")
         processor.checkpoint()
         
-        # Phase 2 & 3: Sequential (use original processor)
-        original = ShortcutProcessor(
-            db_path=db_path,
-            forward_deactivated_table="forward_deactivated",
-            backward_deactivated_table="backward_deactivated",
-            partition_res=cfg.algorithm.partition_res,
-            elementary_table="elementary_shortcuts",
-            sp_method=cfg.algorithm.sp_method,
-            hybrid_res=cfg.algorithm.hybrid_res
-        )
-        original.current_cells = processor.current_cells
-        
-        # Phase 2: Sequential (processor logs its own header)
+        # Phase 2: Hierarchical Consolidation (forward pass)
         phase2_start = time.time()
-        original.process_forward_phase2_consolidation()
+        processor.process_forward_phase2_consolidation()
         logger.info(f"Phase 2 complete ({format_time(time.time() - phase2_start)}).")
     
-    # Phase 3: Always runs (creates original processor if resuming)
-    if forward_count > 0:
-        original = ShortcutProcessor(
-            db_path=db_path,
-            forward_deactivated_table="forward_deactivated",
-            backward_deactivated_table="backward_deactivated",
-            partition_res=cfg.algorithm.partition_res,
-            elementary_table="elementary_shortcuts",
-            sp_method=cfg.algorithm.sp_method,
-            hybrid_res=cfg.algorithm.hybrid_res
-        )
-        # Phase 3 needs current_cells to be non-empty to start
-        original.current_cells = [0]  # Global cell - Phase 3 will populate from forward_deactivated
-    
-    # Phase 3: Sequential (processor logs its own header)
+    # Phase 3: Sequential (OLD consolidation version)
     phase3_start = time.time()
-    original.process_backward_phase3_consolidation()
+    #processor.process_backward_phase3_consolidation()
+    processor.process_backward_phase3_efficient()
     logger.info(f"Phase 3 complete ({format_time(time.time() - phase3_start)}).")
-    
-    # Transfer state back
-    processor.current_cells = original.current_cells
     
     # Phase 4: Parallel (processor logs its own header)
     phase4_start = time.time()
@@ -287,6 +258,21 @@ def run_partitioned_parallel(cfg):
         COPY shortcuts TO '{output_file}' (FORMAT PARQUET)
     """)
     print(f"Saved shortcuts to: {output_file}")
+    
+    # Cleanup: Drop temporary tables, keep only essential ones
+    # Essential: edges, elementary_shortcuts, forward_deactivated, shortcuts
+    tables_to_keep = {'edges', 'elementary_shortcuts', 'forward_deactivated', 'shortcuts'}
+    all_tables = [r[0] for r in processor.con.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+    ).fetchall()]
+    
+    for table in all_tables:
+        if table not in tables_to_keep:
+            processor.con.execute(f"DROP TABLE IF EXISTS \"{table}\"")
+    
+    # Vacuum to reclaim space
+    processor.con.execute("VACUUM")
+    logger.info(f"Database cleaned. Keeping {len(tables_to_keep)} essential tables.")
     
     processor.close()
 

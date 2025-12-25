@@ -60,7 +60,7 @@ def process_chunk_phase1(args):
             CREATE TABLE deactivated (
                 from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
                 lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
-                inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
+                inner_res TINYINT, outer_res TINYINT
             )
         """)
         
@@ -96,7 +96,7 @@ def process_chunk_phase1(args):
             # Collect deactivated shortcuts (NULL current_cell)
             con.execute("""
                 INSERT INTO deactivated
-                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell 
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
                 FROM shortcuts_expanded WHERE current_cell IS NULL
             """)
             
@@ -166,20 +166,20 @@ def process_chunk_phase4(args):
             CREATE TABLE deactivated (
                 from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
                 lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
-                inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
+                inner_res TINYINT, outer_res TINYINT
             )
         """)
         
         initial_count = len(cell_df)
         
-        # Iterative backward loop: partition_res+1 -> 15
-        for res in range(partition_res + 1, 16):
+        # Iterative backward loop: partition_res -> 15
+        for res in range(partition_res, 16):
             # First: Deactivate shortcuts where res > max(inner_res, outer_res)
             # These shortcuts have reached their finest granularity
             con.execute(f"""
                 INSERT INTO deactivated
                 SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                       inner_res, outer_res, NULL::BIGINT AS current_cell
+                       inner_res, outer_res
                 FROM cell_data
                 WHERE {res} > GREATEST(inner_res, outer_res)
             """)
@@ -213,7 +213,9 @@ def process_chunk_phase4(args):
         # Add any remaining shortcuts to deactivated (at res 15)
         con.execute("""
             INSERT INTO deactivated
-            SELECT * FROM cell_data
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                   inner_res, outer_res
+            FROM cell_data
         """)
         
         # Get final result - all deactivated shortcuts
@@ -308,15 +310,25 @@ def _process_cell_forward_worker(con, table_name: str):
         # Run SP on active shortcuts
         _run_shortest_paths_worker(con, "shortcuts_to_process")
         
-        # Replace original table
+        # Replace original table (without current_cell)
         con.execute(f"DROP TABLE IF EXISTS {table_name}")
         con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-        con.execute(f"ALTER TABLE shortcuts_to_process RENAME TO {table_name}")
+        con.execute(f"""
+            CREATE TABLE {table_name} AS
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM shortcuts_to_process
+        """)
         new_count = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
     else:
         con.execute(f"DROP TABLE IF EXISTS {table_name}")
         con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-        con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM shortcuts_to_process WHERE 1=0")
+        con.execute(f"""
+            CREATE TABLE {table_name} (
+                from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
+                lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
+                inner_res TINYINT, outer_res TINYINT
+            )
+        """)
         new_count = 0
     
     con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
@@ -368,14 +380,16 @@ def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
     if active_count > 0:
         _run_shortest_paths_worker(con, "shortcuts_active", method=method)
     
-    # Merge active + inactive back into original table
+    # Merge active + inactive back into original table (without current_cell)
     con.execute(f"DROP TABLE IF EXISTS {table_name}")
     con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
     con.execute(f"""
         CREATE TABLE {table_name} AS
-        SELECT * FROM shortcuts_active
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+        FROM shortcuts_active
         UNION ALL
-        SELECT * FROM shortcuts_inactive
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+        FROM shortcuts_inactive
     """)
     
     total_count = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
@@ -401,6 +415,7 @@ def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
         from sp_methods.pure import compute_shortest_paths_pure_duckdb
         compute_shortest_paths_pure_duckdb(con, quiet=True, input_table="sp_input")
         con.execute("CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input")
+        con.execute("ALTER TABLE shortcuts_next DROP COLUMN current_cell")
     else:
         # SCIPY method
         df = con.execute("SELECT * FROM sp_input").df()
@@ -413,12 +428,15 @@ def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
         
         if results:
             final_df = pd.concat(results, ignore_index=True)
+            # Remove current_cell before deduplication to treat all cells as one pool
+            if 'current_cell' in final_df.columns:
+                final_df = final_df.drop(columns=['current_cell'])
             # Deduplicate
             idx = final_df.groupby(['from_edge', 'to_edge'])['cost'].idxmin()
             final_df = final_df.loc[idx]
             con.execute("""
                 CREATE OR REPLACE TABLE shortcuts_next AS 
-                SELECT from_edge, to_edge, cost, via_edge, current_cell FROM final_df
+                SELECT from_edge, to_edge, cost, via_edge FROM final_df
             """)
         else:
             con.execute(f"CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input WHERE 1=0")
@@ -435,7 +453,7 @@ def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
                 h3_lca(e1.from_cell, e2.to_cell)::BIGINT as outer_cell,
                 h3_resolution(h3_lca(e1.to_cell, e2.from_cell))::TINYINT as inner_res,
                 h3_resolution(h3_lca(e1.from_cell, e2.to_cell))::TINYINT as outer_res,
-                s.current_cell
+        
             FROM shortcuts_next s
             LEFT JOIN edges e1 ON s.from_edge = e1.id
             LEFT JOIN edges e2 ON s.to_edge = e2.id
@@ -448,7 +466,7 @@ def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
             CREATE OR REPLACE TABLE shortcuts_next AS 
             SELECT from_edge, to_edge, cost, via_edge, 
                    0 as lca_res, 0::BIGINT as inner_cell, 0::BIGINT as outer_cell, 
-                   0::TINYINT as inner_res, 0::TINYINT as outer_res, 0::BIGINT as current_cell
+                   0::TINYINT as inner_res, 0::TINYINT as outer_res
             FROM {input_table} WHERE 1=0
         """)
     
@@ -478,14 +496,14 @@ class ParallelShortcutProcessor:
             CREATE TABLE IF NOT EXISTS {self.forward_deactivated_table} (
                 from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
                 lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
-                inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
+                inner_res TINYINT, outer_res TINYINT
             )
         """)
         self.con.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.backward_deactivated_table} (
                 from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
                 lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
-                inner_res TINYINT, outer_res TINYINT, current_cell BIGINT
+                inner_res TINYINT, outer_res TINYINT
             )
         """)
 
@@ -570,7 +588,7 @@ class ParallelShortcutProcessor:
                 if deactivated_df is not None and len(deactivated_df) > 0:
                     self.con.execute(f"""
                         INSERT INTO {self.forward_deactivated_table}
-                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
                         FROM deactivated_df
                     """)
                     total_deactivated += len(deactivated_df)
@@ -590,12 +608,118 @@ class ParallelShortcutProcessor:
         self.current_cells = res_partition_cells
         return res_partition_cells
 
+    def process_forward_phase2_consolidation(self):
+        """
+        Phase 2: Hierarchical Consolidation (Forward Pass)
+        Merges cells upward level by level from partition_res-1 to 0.
+        """
+        log_conf.log_section(logger, f"PHASE 2: HIERARCHICAL CONSOLIDATION ({self.partition_res-1} -> 0)")
+        logger.info(f"  Starting Phase 2 with {len(self.current_cells)} cell tables.")
+
+        for target_res in range(self.partition_res - 1, -2, -1):
+            res_start = time.time()
+            
+            # 1. Group cells by their parent at target_res
+            parent_to_children = {}
+            for cell_id in self.current_cells:
+                parent_id = self.con.execute(f"SELECT h3_parent({cell_id}, {target_res})").fetchone()[0] if target_res >= 0 else 0
+                if parent_id not in parent_to_children:
+                    parent_to_children[parent_id] = []
+                parent_to_children[parent_id].append(cell_id)
+            
+            logger.info(f"  Resolution {target_res}: {len(self.current_cells)} cells -> {len(parent_to_children)} parent cells.")
+            
+            new_cells = []
+            # 2. Process each parent cell
+            for parent_id, children in parent_to_children.items():
+                cell_start = time.time()
+                
+                # Filter children to only those that actually exist
+                valid_children = []
+                for child in children:
+                    if self.con.sql(f"SELECT count(*) FROM information_schema.tables WHERE table_name = 'cell_{child}'").fetchone()[0] > 0:
+                        valid_children.append(child)
+                
+                if not valid_children:
+                    continue
+
+                # 1. Merge children shortcuts and deduplicate
+                merge_sql = " UNION ALL ".join([f"SELECT * FROM cell_{child}" for child in valid_children])
+                self.con.execute(f"""
+                    CREATE OR REPLACE TABLE cell_{parent_id}_tmp AS
+                    SELECT 
+                        from_edge, to_edge, MIN(cost) as cost, arg_min(via_edge, cost) as via_edge,
+                        FIRST(lca_res) as lca_res, FIRST(inner_cell) as inner_cell, FIRST(outer_cell) as outer_cell,
+                        FIRST(inner_res) as inner_res, FIRST(outer_res) as outer_res
+                    FROM ({merge_sql})
+                    GROUP BY from_edge, to_edge
+                """)
+                
+                # Drop old child cell tables BEFORE renaming the parent
+                for child in valid_children:
+                    if child != parent_id:
+                        self.con.execute(f"DROP TABLE IF EXISTS cell_{child}")
+                
+                self.con.execute(f"DROP TABLE IF EXISTS cell_{parent_id}")
+                self.con.execute(f"ALTER TABLE cell_{parent_id}_tmp RENAME TO cell_{parent_id}")
+                
+                merged_count = self.con.sql(f"SELECT count(*) FROM cell_{parent_id}").fetchone()[0]
+                
+                # 2. Assign and process parent cell
+                self.assign_cell_to_shortcuts(target_res, input_table=f"cell_{parent_id}")
+                
+                # Step 3: Process cell
+                active, news, decs = self.process_cell_forward(f"cell_{parent_id}")
+                
+                # Add to new cells list
+                new_cells.append(parent_id)
+                
+                logger.info(f"    Parent {parent_id}: {len(valid_children)} children, {merged_count} merged -> {active} active -> {news} pool, {decs} deactivated ({format_time(time.time() - cell_start)})")
+            
+            # 3. Clean up generic temp tables
+            self.con.execute("DROP TABLE IF EXISTS shortcuts_active")
+            self.con.execute("DROP TABLE IF EXISTS shortcuts_next")
+            self.checkpoint()
+            
+            self.current_cells = list(set(new_cells))
+            logger.info(f"  Res {target_res} complete in {format_time(time.time() - res_start)}. Active cells: {len(self.current_cells)}, Deactivated: {self.con.sql(f'SELECT count(*) FROM {self.forward_deactivated_table}').fetchone()[0]}")
+
+        # Move remaining active cells to deactivated for final processing
+        remaining_active = 0
+        for cell_id in self.current_cells:
+            count = self.con.sql(f"SELECT count(*) FROM cell_{cell_id}").fetchone()[0]
+            remaining_active += count
+            self.con.execute(f"INSERT INTO {self.forward_deactivated_table} SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res FROM cell_{cell_id}")
+            self.con.execute(f"DROP TABLE cell_{cell_id}")
+        
+        total_forward = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
+        
+        # Deduplicate the deactivated table
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE {self.forward_deactivated_table}_dedup AS
+            SELECT 
+                from_edge, to_edge, MIN(cost) as cost, arg_min(via_edge, cost) as via_edge,
+                FIRST(lca_res) as lca_res, FIRST(inner_cell) as inner_cell, FIRST(outer_cell) as outer_cell, FIRST(inner_res) as inner_res, FIRST(outer_res) as outer_res
+            FROM {self.forward_deactivated_table}
+            GROUP BY from_edge, to_edge
+        """)
+        self.con.execute(f"DROP TABLE {self.forward_deactivated_table}")
+        self.con.execute(f"ALTER TABLE {self.forward_deactivated_table}_dedup RENAME TO {self.forward_deactivated_table}")
+        dedup_count = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
+        
+        logger.info("--------------------------------------------------")
+        logger.info(f"  Remaining active at Res -1: {remaining_active}")
+        logger.info(f"  Total deactivated (before dedup): {total_forward}")  
+        logger.info(f"  Deduplicated forward results: {dedup_count}")
+        
+        return dedup_count
+
     def process_backward_phase4_parallel(self):
         """
         PARALLEL Phase 4: Process cells concurrently using multiprocessing.
         Workers use in-memory DBs with data passed as DataFrames.
         """
-        log_conf.log_section(logger, f"PHASE 4: PARALLEL BACKWARD ({self.partition_res+1} -> 15)")
+        log_conf.log_section(logger, f"PHASE 4: PARALLEL BACKWARD ({self.partition_res} -> 15)")
         
         cell_ids = self.current_cells
         total_shortcuts = sum(
@@ -628,7 +752,7 @@ class ParallelShortcutProcessor:
                     # Insert into backward_deactivated
                     self.con.execute(f"""
                         INSERT INTO {self.backward_deactivated_table}
-                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
                         FROM result_df
                     """)
                     total_deactivated += count
@@ -813,7 +937,7 @@ class ParallelShortcutProcessor:
         
         self.con.execute(f"""
             INSERT INTO {self.forward_deactivated_table}
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
             FROM {table_name}_expanded WHERE current_cell IS NULL
         """)
         deactivated_count = self.con.sql(f"SELECT count(*) FROM {table_name}_expanded WHERE current_cell IS NULL").fetchone()[0]
@@ -825,12 +949,23 @@ class ParallelShortcutProcessor:
             self.run_shortest_paths(method=method, quiet=True, input_table="shortcuts_to_process")
             self.con.execute(f"DROP TABLE {table_name}")
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-            self.con.execute(f"ALTER TABLE shortcuts_to_process RENAME TO {table_name}")
+            # Select only base columns (drop current_cell)
+            self.con.execute(f"""
+                CREATE TABLE {table_name} AS
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+                FROM shortcuts_to_process
+            """)
             new_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
         else:
             self.con.execute(f"DROP TABLE {table_name}")
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-            self.con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM shortcuts_to_process WHERE 1=0")
+            self.con.execute(f"""
+                CREATE TABLE {table_name} (
+                    from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
+                    lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
+                    inner_res TINYINT, outer_res TINYINT
+                )
+            """)
             new_count = 0
             
         self.con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
@@ -888,14 +1023,16 @@ class ParallelShortcutProcessor:
             self.run_shortest_paths(method=method, quiet=True, input_table="shortcuts_active")
             new_count = self.con.sql("SELECT count(*) FROM shortcuts_active").fetchone()[0]
         
-        # Merge active + inactive back into original table
+        # Merge active + inactive back into original table (WITHOUT current_cell)
         self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
         self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
         self.con.execute(f"""
             CREATE TABLE {table_name} AS
-            SELECT * FROM shortcuts_active
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM shortcuts_active
             UNION ALL
-            SELECT * FROM shortcuts_inactive
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM shortcuts_inactive
         """)
         
         total_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
@@ -929,9 +1066,12 @@ class ParallelShortcutProcessor:
             
             if results:
                 final_df = pd.concat(results, ignore_index=True)
+                # Remove current_cell before deduplication to treat all cells as one pool
+                if 'current_cell' in final_df.columns:
+                    final_df = final_df.drop(columns=['current_cell'])
                 idx = final_df.groupby(['from_edge', 'to_edge'])['cost'].idxmin()
                 final_df = final_df.loc[idx]
-                self.con.execute("CREATE OR REPLACE TABLE shortcuts_next AS SELECT from_edge, to_edge, cost, via_edge, current_cell FROM final_df")
+                self.con.execute("CREATE OR REPLACE TABLE shortcuts_next AS SELECT from_edge, to_edge, cost, via_edge FROM final_df")
             else:
                 self.con.execute(f"CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input WHERE 1=0")
 
@@ -945,8 +1085,7 @@ class ParallelShortcutProcessor:
                     h3_lca(e1.to_cell, e2.from_cell)::BIGINT as inner_cell,
                     h3_lca(e1.from_cell, e2.to_cell)::BIGINT as outer_cell,
                     h3_resolution(h3_lca(e1.to_cell, e2.from_cell))::TINYINT as inner_res,
-                    h3_resolution(h3_lca(e1.from_cell, e2.to_cell))::TINYINT as outer_res,
-                    s.current_cell
+                    h3_resolution(h3_lca(e1.from_cell, e2.to_cell))::TINYINT as outer_res
                 FROM shortcuts_next s
                 LEFT JOIN edges e1 ON s.from_edge = e1.id
                 LEFT JOIN edges e2 ON s.to_edge = e2.id
@@ -958,7 +1097,7 @@ class ParallelShortcutProcessor:
                 CREATE OR REPLACE TABLE shortcuts_next AS 
                 SELECT from_edge, to_edge, cost, via_edge, 
                        0 as lca_res, 0::BIGINT as inner_cell, 0::BIGINT as outer_cell, 
-                       0::TINYINT as inner_res, 0::TINYINT as outer_res, 0::BIGINT as current_cell
+                       0::TINYINT as inner_res, 0::TINYINT as outer_res
                 FROM {input_table} WHERE 1=0
             """)
 
@@ -966,97 +1105,15 @@ class ParallelShortcutProcessor:
         self.con.execute(f"ALTER TABLE shortcuts_next RENAME TO {input_table}")
         self.con.execute("DROP TABLE IF EXISTS sp_input")
 
-    def process_forward_phase2_consolidation(self):
-        """Phase 2: Hierarchical Consolidation (Forward Pass)"""
-        log_conf.log_section(logger, f"PHASE 2: HIERARCHICAL CONSOLIDATION ({self.partition_res-1} -> 0)")
-        logger.info(f"  Starting Phase 2 with {len(self.current_cells)} cell tables.")
-
-        for target_res in range(self.partition_res - 1, -2, -1):
-            res_start = time.time()
-            
-            parent_to_children = {}
-            for cell_id in self.current_cells:
-                parent_id = self.con.execute(f"SELECT h3_parent({cell_id}, {target_res})").fetchone()[0] if target_res >= 0 else 0
-                if parent_id not in parent_to_children:
-                    parent_to_children[parent_id] = []
-                parent_to_children[parent_id].append(cell_id)
-            
-            logger.info(f"  Resolution {target_res}: {len(self.current_cells)} cells -> {len(parent_to_children)} parent cells.")
-            
-            new_cells = []
-            for parent_id, children in parent_to_children.items():
-                cell_start = time.time()
-                
-                valid_children = [child for child in children 
-                    if self.con.sql(f"SELECT count(*) FROM information_schema.tables WHERE table_name = 'cell_{child}'").fetchone()[0] > 0]
-                
-                if not valid_children:
-                    continue
-
-                merge_sql = " UNION ALL ".join([f"SELECT * FROM cell_{child}" for child in valid_children])
-                self.con.execute(f"""
-                    CREATE OR REPLACE TABLE cell_{parent_id}_tmp AS
-                    SELECT from_edge, to_edge, MIN(cost) as cost, arg_min(via_edge, cost) as via_edge,
-                        FIRST(lca_res) as lca_res, FIRST(inner_cell) as inner_cell, FIRST(outer_cell) as outer_cell,
-                        FIRST(inner_res) as inner_res, FIRST(outer_res) as outer_res, current_cell
-                    FROM ({merge_sql})
-                    GROUP BY from_edge, to_edge, current_cell
-                """)
-                
-                for child in valid_children:
-                    if child != parent_id:
-                        self.con.execute(f"DROP TABLE IF EXISTS cell_{child}")
-                
-                self.con.execute(f"DROP TABLE IF EXISTS cell_{parent_id}")
-                self.con.execute(f"ALTER TABLE cell_{parent_id}_tmp RENAME TO cell_{parent_id}")
-                
-                merged_count = self.con.sql(f"SELECT count(*) FROM cell_{parent_id}").fetchone()[0]
-                self.assign_cell_to_shortcuts(target_res, input_table=f"cell_{parent_id}")
-                active, news, decs = self.process_cell_forward(f"cell_{parent_id}")
-                new_cells.append(parent_id)
-                
-                logger.info(f"    Parent {parent_id}: {len(valid_children)} children, {merged_count} merged -> {active} active -> {news} pool, {decs} deactivated ({format_time(time.time() - cell_start)})")
-            
-            self.con.execute("DROP TABLE IF EXISTS shortcuts_active")
-            self.con.execute("DROP TABLE IF EXISTS shortcuts_next")
-            self.checkpoint()
-            
-            self.current_cells = list(set(new_cells))
-            logger.info(f"  Res {target_res} complete in {format_time(time.time() - res_start)}. Active cells: {len(self.current_cells)}, Deactivated: {self.con.sql(f'SELECT count(*) FROM {self.forward_deactivated_table}').fetchone()[0]}")
-
-        remaining_active = 0
-        for cell_id in self.current_cells:
-            count = self.con.sql(f"SELECT count(*) FROM cell_{cell_id}").fetchone()[0]
-            remaining_active += count
-            self.con.execute(f"INSERT INTO {self.forward_deactivated_table} SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell FROM cell_{cell_id}")
-            self.con.execute(f"DROP TABLE cell_{cell_id}")
-        
-        total_forward = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
-        
-        self.con.execute(f"""
-            CREATE OR REPLACE TABLE {self.forward_deactivated_table}_dedup AS
-            SELECT from_edge, to_edge, MIN(cost) as cost, arg_min(via_edge, cost) as via_edge,
-                FIRST(lca_res) as lca_res, FIRST(inner_cell) as inner_cell, FIRST(outer_cell) as outer_cell, 
-                FIRST(inner_res) as inner_res, FIRST(outer_res) as outer_res, FIRST(current_cell) as current_cell
-            FROM {self.forward_deactivated_table}
-            GROUP BY from_edge, to_edge
-        """)
-        self.con.execute(f"DROP TABLE {self.forward_deactivated_table}")
-        self.con.execute(f"ALTER TABLE {self.forward_deactivated_table}_dedup RENAME TO {self.forward_deactivated_table}")
-        dedup_count = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
-        
-        logger.info("--------------------------------------------------")
-        logger.info(f"  Remaining active at Res -1: {remaining_active}")
-        logger.info(f"  Total deactivated (before dedup): {total_forward}")  
-        logger.info(f"  Deduplicated forward results: {dedup_count}")
-        
-        return dedup_count
 
     def process_backward_phase3_consolidation(self):
-        """Phase 3: Backward Consolidation (0 -> partition_res)"""
-        log_conf.log_section(logger, f"PHASE 3: BACKWARD CONSOLIDATION (0 -> {self.partition_res})")
-        if not self.current_cells:
-            logger.warning("No cells to process in Phase 3.")
+        """Phase 3: Backward Consolidation (0 -> partition_res-1)"""
+        log_conf.log_section(logger, f"PHASE 3: BACKWARD CONSOLIDATION (0 -> {self.partition_res-1})")
+        
+        # Check if forward_deactivated has data (works for both fresh run and resume)
+        forward_count = self.con.sql(f"SELECT count(*) FROM {self.forward_deactivated_table}").fetchone()[0]
+        if forward_count == 0:
+            logger.warning("No shortcuts in forward_deactivated to process in Phase 3.")
             return
 
         self.con.execute(f"""
@@ -1064,13 +1121,17 @@ class ParallelShortcutProcessor:
             SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
             FROM {self.forward_deactivated_table}
         """)
-        forward_count = self.con.sql("SELECT count(*) FROM shortcuts").fetchone()[0]
         logger.info(f"Starting backward consolidation with {forward_count} shortcuts from forward pass.")
 
         self.con.execute("DROP TABLE IF EXISTS cell_0")
         self.con.execute("ALTER TABLE shortcuts RENAME TO cell_0")
         self.current_cells = [0]
         logger.info(f"  Starting with {forward_count} shortcuts in global cell_0.")
+
+        # Track cumulative timing
+        total_partition_time = 0.0
+        total_assign_time = 0.0
+        total_sp_time = 0.0
 
         for target_res in range(-1, self.partition_res):
             res_start = time.time()
@@ -1087,12 +1148,13 @@ class ParallelShortcutProcessor:
                 t_partition = time.time()
                 self.partition_to_children(child_res, children_for_parent, input_table=f"cell_{parent_cell}")
                 t_partition = time.time() - t_partition
+                total_partition_time += t_partition
                 
                 null_count = self.con.execute(f"SELECT COUNT(*) FROM cell_{parent_cell} WHERE current_cell IS NULL").fetchone()[0]
                 if null_count > 0:
                     self.con.execute(f"""
                         INSERT INTO {self.backward_deactivated_table}
-                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res, current_cell
+                        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
                         FROM cell_{parent_cell} WHERE current_cell IS NULL
                     """)
                     total_deactivated += null_count
@@ -1112,7 +1174,11 @@ class ParallelShortcutProcessor:
                     active_children.add(child_id)
                 
                 self.con.execute(f"DROP TABLE IF EXISTS cell_{parent_cell}")
-              
+                if child_res == self.partition_res:
+                    self.con.execute(f"DROP TABLE IF EXISTS cell_{parent_cell}")
+                    list_children_cells += list(active_children)
+                    continue
+
                 for child_id in active_children:
                     child_start = time.time()
                     child_count = self.con.sql(f"SELECT count(*) FROM cell_{child_id}").fetchone()[0]
@@ -1123,12 +1189,14 @@ class ParallelShortcutProcessor:
                     t_assign = time.time()
                     self.assign_cell_to_shortcuts(child_res, input_table=f"cell_{child_id}")
                     t_assign = time.time() - t_assign
+                    total_assign_time += t_assign
                     
                     # Use process_cell_backward to split active/inactive, run SP, merge back
                     t_sp = time.time()
                     method = self.get_sp_method_for_resolution(child_res, is_forward=False)
                     active_count, news, _ = self.process_cell_backward(f"cell_{child_id}", method=method)
                     t_sp = time.time() - t_sp
+                    total_sp_time += t_sp
                     
                     logger.info(f"      Cell {child_id}: {child_count} -> {news} [assign={t_assign:.2f}s, partition={t_partition:.2f}s, SP={t_sp:.2f}s]")
                     
@@ -1143,14 +1211,183 @@ class ParallelShortcutProcessor:
             self.current_cells = list_children_cells
             
             self.vacuum()
-            logger.info(f"  Res {target_res} -> {child_res} complete in {format_time(time.time() - res_start)}. Active cells: {len(list_children_cells)}, Deactivated so far: {self.con.sql(f'SELECT count(*) FROM {self.backward_deactivated_table}').fetchone()[0]}")
-
+            if child_res < self.partition_res:
+                logger.info(f"  Res {target_res} -> {child_res} complete in {format_time(time.time() - res_start)}. Active cells: {len(list_children_cells)}, Deactivated so far: {self.con.sql(f'SELECT count(*) FROM {self.backward_deactivated_table}').fetchone()[0]}")
+          
         remaining_active = sum(
             self.con.sql(f"SELECT count(*) FROM cell_{cell_id}").fetchone()[0]
             for cell_id in self.current_cells
         )
         total_backward = self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
         logger.info("--------------------------------------------------")
+        logger.info(f"  Timing breakdown: partition={total_partition_time:.2f}s, assign={total_assign_time:.2f}s, SP={total_sp_time:.2f}s")
+        logger.info(f"  Summary: {len(self.current_cells)} cells ({remaining_active} shortcuts) remain for Phase 4. Deactivated: {total_backward}")
+        
+        return total_backward
+
+    def process_backward_phase3_efficient(self):
+        """
+        Phase 3 Efficient: Backward Consolidation (0 -> partition_res)
+        Simplified version that processes all shortcuts in a single table (cell_0).
+        Similar structure to Phase 1 but in reverse direction.
+        """
+        log_conf.log_section(logger, f"PHASE 3 EFFICIENT: BACKWARD CONSOLIDATION (0 -> {self.partition_res - 1})")
+        
+        phase3_start = time.time()
+        
+        # Load forward deactivated shortcuts into cell_0 (global cell)
+        t_load = time.time()
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE cell_0 AS
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM {self.forward_deactivated_table}
+        """)
+        t_load = time.time() - t_load
+        
+        forward_count = self.con.sql("SELECT count(*) FROM cell_0").fetchone()[0]
+        self.current_cells = [0]
+        logger.info(f"  Loaded {forward_count} shortcuts from forward pass. [{t_load:.2f}s]")
+        
+        if forward_count == 0:
+            logger.warning("  No shortcuts to process in Phase 3.")
+            self.current_cells = []
+            return 0
+        
+        # Track cumulative timing
+        total_deactivate_time = 0.0
+        total_assign_time = 0.0
+        total_sp_time = 0.0
+        
+        # Iterative backward loop: 0 -> partition_res
+        for res in range(0, self.partition_res):
+            res_start = time.time()
+            
+            # First: Deactivate shortcuts where res > max(inner_res, outer_res)
+            t_deact = time.time()
+            deactivated_count = self.con.execute(f"""
+                SELECT count(*) FROM cell_0 WHERE {res} > GREATEST(inner_res, outer_res)
+            """).fetchone()[0]
+            
+            if deactivated_count > 0:
+                self.con.execute(f"""
+                    INSERT INTO {self.backward_deactivated_table}
+                    SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                           inner_res, outer_res
+                    FROM cell_0
+                    WHERE {res} > GREATEST(inner_res, outer_res)
+                """)
+                
+                self.con.execute(f"""
+                    CREATE OR REPLACE TABLE cell_0 AS
+                    SELECT * FROM cell_0
+                    WHERE {res} <= GREATEST(inner_res, outer_res)
+                """)
+            t_deact = time.time() - t_deact
+            total_deactivate_time += t_deact
+            
+            remaining = self.con.execute("SELECT count(*) FROM cell_0").fetchone()[0]
+            if remaining == 0:
+                logger.info(f"  Res {res}: All shortcuts deactivated. Stopping.")
+                break
+            
+            # Assign cells
+            t_assign = time.time()
+            self.assign_cell_to_shortcuts(res, input_table="cell_0")
+            t_assign = time.time() - t_assign
+            total_assign_time += t_assign
+            
+            # Determine method and run SP
+            method = self.get_sp_method_for_resolution(res, is_forward=False)
+            t_sp = time.time()
+            active_count, new_count, _ = self.process_cell_backward("cell_0", method=method)
+            t_sp = time.time() - t_sp
+            total_sp_time += t_sp
+            
+            after_count = self.con.execute("SELECT count(*) FROM cell_0").fetchone()[0]
+            total_deactivated = self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
+            
+            logger.info(f"  Res {res}: {remaining} -> {active_count} active -> {after_count} pool [deact={t_deact:.2f}s, assign={t_assign:.2f}s, SP={t_sp:.2f}s]")
+                
+        # Final deactivation at partition_res boundary
+        t_final_deact = time.time()
+        deactivated_count = self.con.execute(f"""
+                SELECT count(*) FROM cell_0 WHERE {self.partition_res} > GREATEST(inner_res, outer_res)
+            """).fetchone()[0]
+
+        if deactivated_count > 0:
+                self.con.execute(f"""
+                    INSERT INTO {self.backward_deactivated_table}
+                    SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                           inner_res, outer_res
+                    FROM cell_0
+                    WHERE {self.partition_res} > GREATEST(inner_res, outer_res)
+                """)
+                
+                self.con.execute(f"""
+                    CREATE OR REPLACE TABLE cell_0 AS
+                    SELECT * FROM cell_0
+                    WHERE {self.partition_res} <= GREATEST(inner_res, outer_res)
+                """)
+        t_final_deact = time.time() - t_final_deact
+        total_deactivate_time += t_final_deact
+
+        # Split shortcuts for Phase 4
+        t_split = time.time()
+        self.con.execute(f"""
+            CREATE OR REPLACE TABLE cell_0 AS
+            SELECT 
+                from_edge, to_edge, cost, via_edge, lca_res, 
+                inner_cell, outer_cell, inner_res, outer_res,
+                CASE WHEN inner_res >= {self.partition_res} 
+                     THEN h3_parent(inner_cell::BIGINT, {self.partition_res}) 
+                     ELSE NULL END AS current_cell_in,
+                CASE WHEN outer_res >= {self.partition_res} 
+                     THEN h3_parent(outer_cell::BIGINT, {self.partition_res}) 
+                     ELSE NULL END AS current_cell_out
+            FROM cell_0
+        """)
+
+        # Get distinct cells and create cell tables
+        self.con.execute("""
+            CREATE OR REPLACE TABLE current_splits AS
+            SELECT DISTINCT current_cell_in AS current_cell FROM cell_0 WHERE current_cell_in IS NOT NULL
+            UNION
+            SELECT DISTINCT current_cell_out AS current_cell FROM cell_0 WHERE current_cell_out IS NOT NULL
+        """)
+
+        cell_ids = [r[0] for r in self.con.execute("SELECT current_cell FROM current_splits").fetchall()]
+        
+        for cell_id in cell_ids:
+            self.con.execute(f"""
+                CREATE OR REPLACE TABLE cell_{cell_id} AS
+                SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+                       inner_res, outer_res, current_cell_in, current_cell_out
+                FROM cell_0
+                WHERE current_cell_in = {cell_id} OR current_cell_out = {cell_id}
+            """)
+        
+        self.current_cells = cell_ids
+        
+        # Insert inactive shortcuts (no assigned cell) directly into backward_deactivated
+        self.con.execute(f"""
+            INSERT INTO {self.backward_deactivated_table}
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM cell_0
+            WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+        """)
+        
+        self.con.execute("DROP TABLE IF EXISTS cell_0")
+        self.con.execute("DROP TABLE IF EXISTS current_splits")
+        t_split = time.time() - t_split
+        
+        remaining_active = sum(
+            self.con.sql(f"SELECT count(*) FROM cell_{cell_id}").fetchone()[0]
+            for cell_id in self.current_cells
+        ) if self.current_cells else 0
+        total_backward = self.con.sql(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
+        
+        logger.info("--------------------------------------------------")
+        logger.info(f"  Timing breakdown: deactivate={total_deactivate_time:.2f}s, assign={total_assign_time:.2f}s, SP={total_sp_time:.2f}s, split={t_split:.2f}s")
         logger.info(f"  Summary: {len(self.current_cells)} cells ({remaining_active} shortcuts) remain for Phase 4. Deactivated: {total_backward}")
         
         return total_backward

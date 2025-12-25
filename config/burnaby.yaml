@@ -27,4 +27,4 @@ parallel:
 duckdb:
   memory_limit: "12GB"
   threads: null        # null = auto-detect
-  fresh_start: False   # If true, delete existing DB before running
+  fresh_start: True   # If true, delete existing DB before running

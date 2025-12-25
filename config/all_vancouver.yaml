@@ -30,7 +30,7 @@ duckdb:
 
 # Parallel Execution Configuration
 parallel:
-  workers: 10           # 1 = single-threaded, >1 = parallel with N workers
+  workers: 3           # 1 = single-threaded, >1 = parallel with N workers
   chunk_size: 1000     # Chunk size for parallel processing
 
 # Logging Configuration
