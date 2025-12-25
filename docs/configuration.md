@@ -1,104 +1,163 @@
-# Configuration Guide
+# Configuration Reference
 
-## Overview
+This document explains all configuration options for the shortcut generation pipeline.
 
-All configuration is centralized in `src/config.py`. This guide explains each setting.
+## Configuration Files
 
-## DuckDB Settings
+Configuration uses YAML files in the `config/` directory:
+- `default.yaml` - Base defaults
+- `burnaby.yaml`, `all_vancouver.yaml` - District-specific overrides
 
-```python
-# Memory limit for DuckDB operations
-DUCKDB_MEMORY_LIMIT = "16GB"
+Run with: `python main.py --config config/burnaby.yaml`
 
-# Directory for persistent database files
-DUCKDB_PERSIST_DIR = "persist/"
+## Configuration Sections
+
+### Input
+
+```yaml
+input:
+  edges_file: "/path/to/{district}_edges_with_h3.csv"
+  graph_file: "/path/to/{district}_edge_graph.csv"
+  district: "Burnaby"
 ```
 
-### Memory Considerations
+| Field | Description |
+|-------|-------------|
+| `edges_file` | Path to edge data with H3 indices. `{district}` is replaced. |
+| `graph_file` | Path to edge connectivity graph |
+| `district` | District name for file paths and output naming |
 
-- **Small datasets (<10K edges)**: 4GB is sufficient
-- **Medium datasets (10K-50K edges)**: 8-16GB recommended
-- **Large datasets (>50K edges)**: Use partitioned algorithm
+### Output
 
-## Input File Paths
-
-```python
-# District to process (change this for different datasets)
-DISTRICT_NAME = "Burnaby"
-
-# Edge data with H3 indices
-EDGES_FILE = f"/path/to/{DISTRICT_NAME}_edges_with_h3.csv"
-
-# Edge graph (connectivity)
-GRAPH_FILE = f"/path/to/{DISTRICT_NAME}_edge_graph.csv"
+```yaml
+output:
+  directory: "output"
+  shortcuts_file: "{district}_shortcuts"
+  persist_dir: "persist"
 ```
 
-### Required Input Format
+| Field | Description |
+|-------|-------------|
+| `directory` | Output directory for shortcuts parquet |
+| `shortcuts_file` | Output filename (without extension) |
+| `persist_dir` | Directory for DuckDB persistent database |
 
-**edges_with_h3.csv**:
-```csv
-id,from_cell,to_cell,lca_res,cost,...
-1,644733694722389744,644733694722358043,12,1.5,...
+### Algorithm
+
+```yaml
+algorithm:
+  name: "partitioned"      # Algorithm to use
+  sp_method: "HYBRID"      # Shortest path method
+  hybrid_res: 10           # Resolution threshold for HYBRID
+  partition_res: 7         # Partition resolution for phases 1 & 4
+  min_res: 0               # Minimum H3 resolution
+  max_res: 15              # Maximum H3 resolution
 ```
 
-**edge_graph.csv**:
-```csv
-from_edge,to_edge
-1,2
-1,3
-2,4
+| Field | Values | Description |
+|-------|--------|-------------|
+| `name` | `partitioned` | Algorithm type (currently only partitioned) |
+| `sp_method` | `SCIPY`, `PURE`, `HYBRID` | Shortest path computation method |
+| `hybrid_res` | 0-15 | Threshold: PURE for res >= this, SCIPY below |
+| `partition_res` | 5-8 | Cell resolution for chunking phases 1 & 4 |
+
+### DuckDB
+
+```yaml
+duckdb:
+  memory_limit: "12GB"
+  threads: null            # null = auto-detect
+  fresh_start: true        # Delete existing DB before run
 ```
 
-## Output Settings
+| Field | Description |
+|-------|-------------|
+| `memory_limit` | Maximum memory for DuckDB operations |
+| `threads` | CPU threads (null = auto) |
+| `fresh_start` | If true, delete existing database on startup |
 
-```python
-# Output directory
-OUTPUT_DIR = "output/"
+### Parallel
 
-# Output file (without extension - will be saved as parquet)
-SHORTCUTS_OUTPUT_FILE = "output/Burnaby_shortcuts"
+```yaml
+parallel:
+  workers: 4               # Default workers for all phases
+  workers_phase1: 10       # Override for Phase 1
+  workers_phase4: 2        # Override for Phase 4
 ```
 
-## Resolution Parameters
+| Field | Description |
+|-------|-------------|
+| `workers` | Default worker count |
+| `workers_phase1` | Workers for Phase 1 (forward chunked) |
+| `workers_phase2` | Workers for Phase 2 SP calls |
+| `workers_phase3` | Workers for Phase 3 SP calls |
+| `workers_phase4` | Workers for Phase 4 (backward chunked) |
 
-```python
-# H3 resolution range (typically 0-15)
-MIN_H3_RESOLUTION = 0
-MAX_H3_RESOLUTION = 15
+See [parallel_processing.md](parallel_processing.md) for memory considerations.
+
+### Logging
+
+```yaml
+logging:
+  level: "INFO"            # Log level
+  verbose: true            # Extra detail in logs
 ```
 
-## Algorithm-Specific Settings
+## Example Configurations
 
-### Hybrid Algorithm
-
-Edit `generate_shortcuts_hybrid.py` to adjust resolution thresholds:
-
-```python
-# Resolutions using Scipy (larger cells, faster)
-SCIPY_RESOLUTIONS = list(range(-1, 10))
-
-# Resolutions using Pure DuckDB (smaller cells, simpler)
-PURE_RESOLUTIONS = list(range(10, 16))
+### Small Dataset (Testing)
+```yaml
+input:
+  district: "Burnaby"
+algorithm:
+  sp_method: HYBRID
+  hybrid_res: 10
+  partition_res: 7
+parallel:
+  workers: 1
 ```
 
-### Partitioned Algorithm
-
-Edit `generate_shortcuts_partitioned.py`:
-
-```python
-# Resolution for partitioning (typically 6-8)
-PARTITION_RES = 7
+### Large Dataset (Production)
+```yaml
+input:
+  district: "All_Vancouver"
+algorithm:
+  sp_method: HYBRID
+  hybrid_res: 10
+  partition_res: 6
+duckdb:
+  memory_limit: "24GB"
+parallel:
+  workers: 4
+  workers_phase1: 10
+  workers_phase4: 2
 ```
 
-Lower values = fewer partitions, more memory per partition
-Higher values = more partitions, less memory per partition
+## Input File Formats
 
-## Environment Variables
+### edges_with_h3.csv
 
-Override config via environment:
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INT | Unique edge identifier |
+| from_cell | BIGINT | H3 cell of edge start |
+| to_cell | BIGINT | H3 cell of edge end |
+| lca_res | INT | LCA resolution of from/to cells |
+| cost | FLOAT | Edge traversal cost |
 
-```bash
-export DUCKDB_MEMORY_LIMIT="32GB"
-export DUCKDB_PERSIST_DIR="/tmp/duckdb_persist"
-python generate_shortcuts_hybrid.py
-```
+### edge_graph.csv
+
+| Column | Type | Description |
+|--------|------|-------------|
+| from_edge | INT | Source edge ID |
+| to_edge | INT | Target edge ID |
+
+Represents connectivity: a row means you can traverse from `from_edge` to `to_edge`.
+
+## Output Format
+
+Output is a Parquet file with columns:
+- `from_edge`: Source edge ID
+- `to_edge`: Destination edge ID  
+- `cost`: Total cost of optimal path
+- `via_edge`: First intermediate edge (for path reconstruction)

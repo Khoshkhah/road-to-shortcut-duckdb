@@ -32,8 +32,8 @@ duckdb:
 # Parallel Execution Configuration
 parallel:
   workers: 1           # 1 = single-threaded, >1 = parallel with N workers
-  chunk_size: 1000     # Chunk size for parallel processing
-
+  workers_phase1: 10   # Override for Phase 1
+  workers_phase4: 2    # Override for Phase 4
 # Logging Configuration
 logging:
   level: "INFO"        # Options: "INFO", "DEBUG", "WARNING", "ERROR"

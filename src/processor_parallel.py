@@ -44,13 +44,14 @@ def process_chunk_phase1(args):
     con.create_function("h3_parent", utils._get_parent_cell_impl, ["BIGINT", "INTEGER"], "BIGINT")
     
     timing_info = []  # List of (res, method, time)
+    start_time = time.time()
     
     try:
         # Load edges into worker's in-memory DB
         con.execute("CREATE TABLE edges AS SELECT * FROM edges_df")
         
         if len(shortcuts_df) == 0:
-            return (chunk_id, None, None, 0, [])
+            return (chunk_id, None, None, 0, [], time.time() - start_time)
         
         # Create table for processing
         con.execute("CREATE TABLE shortcuts AS SELECT * FROM shortcuts_df")
@@ -63,6 +64,8 @@ def process_chunk_phase1(args):
                 inner_res TINYINT, outer_res TINYINT
             )
         """)
+        
+        # ... (rest of function unchanged, just returning duration at end)
         
         # Iterative Forward Pass (15 -> partition_res)
         for res in range(15, partition_res - 1, -1):
@@ -125,7 +128,7 @@ def process_chunk_phase1(args):
         active_df = con.execute("SELECT * FROM shortcuts").df()
         deactivated_df = con.execute("SELECT * FROM deactivated").df()
         
-        return (chunk_id, active_df, deactivated_df, len(active_df), timing_info)
+        return (chunk_id, active_df, deactivated_df, len(active_df), timing_info, time.time() - start_time)
     
     except Exception as e:
         import traceback
@@ -140,7 +143,7 @@ def process_chunk_phase4(args):
     """
     Worker function for Phase 4 parallel processing.
     Uses in-memory DuckDB. Receives data as DataFrames.
-    Returns: (cell_id, shortcuts_df, count, timing_info)
+    Returns: (cell_id, shortcuts_df, count, timing_info, duration)
     """
     cell_id, edges_df, cell_df, partition_res, sp_method, hybrid_res = args
     
@@ -153,6 +156,7 @@ def process_chunk_phase4(args):
     con.create_function("h3_parent", utils._get_parent_cell_impl, ["BIGINT", "INTEGER"], "BIGINT")
     
     timing_info = []  # List of (res, method, time)
+    start_time = time.time()
     
     try:
         # Load edges into worker's in-memory DB
@@ -222,12 +226,12 @@ def process_chunk_phase4(args):
         result_df = con.execute("SELECT * FROM deactivated").df()
         final_count = len(result_df)
         
-        return (cell_id, result_df, final_count, timing_info)
+        return (cell_id, result_df, final_count, timing_info, time.time() - start_time)
     
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return (cell_id, None, 0, [])
+        return (cell_id, None, 0, [], time.time() - start_time)
     finally:
         con.close()
 
@@ -335,7 +339,124 @@ def _process_cell_forward_worker(con, table_name: str):
     return active_count, new_count
 
 
-def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
+def _process_cell_forward_worker(con, table_name: str, method: str = "SCIPY", num_workers: int = 1):
+    """
+    Worker version of process_cell_forward.
+    Expands from current_cell_in/out to current_cell, 
+    splits active (SP) and inactive (deactivated), 
+    returns counts and ensures result is back in table_name.
+    """
+    # Step 1: Expand
+    con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+    con.execute(f"""
+        CREATE TABLE {table_name}_expanded AS
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_in AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NOT NULL
+        UNION
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, current_cell_out AS current_cell
+        FROM {table_name}
+        WHERE current_cell_out IS NOT NULL 
+          AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
+        UNION ALL
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
+               inner_res, outer_res, NULL AS current_cell
+        FROM {table_name}
+        WHERE current_cell_in IS NULL AND current_cell_out IS NULL
+    """)
+    
+    # Step 2: Separate
+    con.execute(f"DROP TABLE IF EXISTS shortcuts_to_process")
+    con.execute(f"CREATE TEMPORARY TABLE shortcuts_to_process AS SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL")
+    
+    con.execute(f"DROP TABLE IF EXISTS deactivated")
+    con.execute(f"""
+        CREATE TABLE deactivated AS
+        SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+        FROM {table_name}_expanded WHERE current_cell IS NULL
+    """)
+    
+    active_count = con.execute("SELECT count(*) FROM shortcuts_to_process").fetchone()[0]
+    deactivated_count = con.execute("SELECT count(*) FROM deactivated").fetchone()[0]
+    
+    new_count = 0
+    if active_count > 0:
+        _run_shortest_paths_worker(con, "shortcuts_to_process", method=method, num_workers=num_workers)
+        con.execute(f"DROP TABLE {table_name}")
+        con.execute(f"""
+            CREATE TABLE {table_name} AS
+            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+            FROM shortcuts_to_process
+        """)
+        new_count = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+    else:
+        con.execute(f"DROP TABLE {table_name}")
+        con.execute(f"""
+            CREATE TABLE {table_name} (
+                from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
+                lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
+                inner_res TINYINT, outer_res TINYINT
+            )
+        """)
+    
+    con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
+    con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
+    
+    return active_count, new_count, deactivated_count
+
+
+def process_chunk_phase2(args):
+    """
+    Worker function for Phase 2 parallel processing.
+    """
+    parent_id, edges_df, shortcuts_df, target_res, sp_method, hybrid_res = args
+    
+    con = duckdb.connect(":memory:")
+    con.create_function("h3_lca", utils._find_lca_impl, ["BIGINT", "BIGINT"], "BIGINT")
+    con.create_function("h3_resolution", utils._find_resolution_impl, ["BIGINT"], "INTEGER")
+    con.create_function("h3_parent", utils._get_parent_cell_impl, ["BIGINT", "INTEGER"], "BIGINT")
+    
+    start_time = time.time()
+    
+    try:
+        con.execute("CREATE TABLE edges AS SELECT * FROM edges_df")
+        con.execute("CREATE TABLE shortcuts AS SELECT * FROM shortcuts_df")
+        
+        # Merge and Deduplicate
+        con.execute("""
+            CREATE OR REPLACE TABLE shortcuts_merged AS
+            SELECT 
+                from_edge, to_edge, MIN(cost) as cost, arg_min(via_edge, cost) as via_edge,
+                FIRST(lca_res) as lca_res, FIRST(inner_cell) as inner_cell, FIRST(outer_cell) as outer_cell,
+                FIRST(inner_res) as inner_res, FIRST(outer_res) as outer_res
+            FROM shortcuts
+            GROUP BY from_edge, to_edge
+        """)
+        
+        merged_count = con.execute("SELECT count(*) FROM shortcuts_merged").fetchone()[0]
+        
+        # Assign cells
+        _assign_cell_to_shortcuts_worker(con, target_res, "shortcuts_merged")
+        
+        # Process cell (Forward)
+        active, news, decs = _process_cell_forward_worker(con, "shortcuts_merged", method=sp_method)
+        
+        result_df = con.execute("SELECT * FROM shortcuts_merged").df()
+        deactivated_df = con.execute("SELECT * FROM deactivated").df()
+        
+        return (parent_id, result_df, deactivated_df, merged_count, active, news, decs, time.time() - start_time)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return (parent_id, None, None, 0, 0, 0, 0, time.time() - start_time)
+    finally:
+        con.close()
+
+
+def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY", num_workers: int = 1):
     """
     Worker version of process_cell_backward.
     Expands current_cell_in/out to single current_cell, then splits active/inactive, 
@@ -378,7 +499,7 @@ def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
     active_count = con.execute("SELECT count(*) FROM shortcuts_active").fetchone()[0]
     
     if active_count > 0:
-        _run_shortest_paths_worker(con, "shortcuts_active", method=method)
+        _run_shortest_paths_worker(con, "shortcuts_active", method=method, num_workers=num_workers)
     
     # Merge active + inactive back into original table (without current_cell)
     con.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -401,7 +522,7 @@ def _process_cell_backward_worker(con, table_name: str, method: str = "SCIPY"):
     return active_count, total_count
 
 
-def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
+def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY", num_workers: int = 1):
     """Worker version of run_shortest_paths. Supports SCIPY and PURE methods."""
     con.execute("DROP TABLE IF EXISTS sp_input")
     con.execute(f"""
@@ -419,12 +540,32 @@ def _run_shortest_paths_worker(con, input_table: str, method: str = "SCIPY"):
     else:
         # SCIPY method
         df = con.execute("SELECT * FROM sp_input").df()
+        
+        if df.empty:
+            con.execute(f"CREATE OR REPLACE TABLE shortcuts_next AS SELECT * FROM sp_input WHERE 1=0")
+            return
+            
+        partitions = list(df.groupby('current_cell'))
         results = []
-        for cell, group in df.groupby('current_cell'):
-            processed = process_partition_scipy(group)
-            if not processed.empty:
-                processed['current_cell'] = cell
-                results.append(processed)
+        
+        if num_workers > 1 and len(partitions) > 1:
+            # Parallel processing of partitions
+            # Flatten partitions to just the DataFrames for simplicity
+            groups = [group for cell, group in partitions]
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                processed_groups = list(executor.map(process_partition_scipy, groups))
+            
+            for (cell, _), processed in zip(partitions, processed_groups):
+                if not processed.empty:
+                    processed['current_cell'] = cell
+                    results.append(processed)
+        else:
+            # Sequential processing
+            for cell, group in partitions:
+                processed = process_partition_scipy(group)
+                if not processed.empty:
+                    processed['current_cell'] = cell
+                    results.append(processed)
         
         if results:
             final_df = pd.concat(results, ignore_index=True)
@@ -479,17 +620,27 @@ class ParallelShortcutProcessor:
     """Parallel version of ShortcutProcessor with multiprocessing for Phase 1 and 4."""
     
     def __init__(self, db_path: str, forward_deactivated_table: str, backward_deactivated_table: str, 
-                 partition_res: int = PARTITION_RES, elementary_table: str = "elementary_table",
-                 sp_method: str = None, hybrid_res: int = 10):
+                 partition_res: int = 7, elementary_table: str = "elementary_table",
+                 sp_method: str = "HYBRID", hybrid_res: int = 10, worker_config: dict = None):
         self.db_path = db_path
         self.con = utils.initialize_duckdb(db_path)
         self.forward_deactivated_table = forward_deactivated_table
         self.backward_deactivated_table = backward_deactivated_table
         self.partition_res = partition_res
         self.elementary_table = elementary_table
-        self.sp_method = sp_method or SP_METHOD
+        self.sp_method = sp_method
         self.hybrid_res = hybrid_res
         self.current_cells = []
+        
+        # Setup worker configuration
+        if worker_config:
+            self.workers = worker_config
+        else:
+            # Fallback to current global settings
+            self.workers = {
+                'phase1': MAX_WORKERS,
+                'phase4': MAX_WORKERS
+            }
         
         # Ensure tables exist
         self.con.execute(f"""
@@ -517,6 +668,22 @@ class ParallelShortcutProcessor:
         utils.read_edges(self.con, edges_file)
         utils.create_edges_cost_table(self.con, edges_file)
         utils.initial_shortcuts_table(self.con, graph_file)
+        
+        # Log initial statistics
+        edge_count = self.con.execute("SELECT count(*) FROM edges").fetchone()[0]
+        node_count = self.con.execute("""
+            SELECT count(DISTINCT id) FROM (
+                SELECT from_cell as id FROM edges
+                UNION
+                SELECT to_cell as id FROM edges
+            )
+        """).fetchone()[0]
+        elementary_count = self.con.execute("SELECT count(*) FROM shortcuts").fetchone()[0]
+        
+        logger.info(f"Statistics:")
+        logger.info(f"  Nodes: {node_count:,}")
+        logger.info(f"  Edges: {edge_count:,}")
+        logger.info(f"  Initial Shortcuts: {elementary_count:,}")
         
         logger.info("Pre-calculating H3 metadata...")
         self.con.execute(f"""
@@ -554,8 +721,6 @@ class ParallelShortcutProcessor:
             WHERE c != 0
         """)
         chunk_ids = [r[0] for r in self.con.execute("SELECT cell_id FROM chunks").fetchall()]
-        logger.info(f"  Processing {len(chunk_ids)} chunks in parallel (max {MAX_WORKERS} workers)...")
-        
         # Load edges once - shared by all workers
         edges_df = self.con.execute("SELECT * FROM edges").df()
         
@@ -572,19 +737,43 @@ class ParallelShortcutProcessor:
         res_partition_cells = []
         total_deactivated = 0
         all_timing_info = []  # Collect timing from all workers
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_chunk_phase1, args): args[0] for args in args_list}
-            
-            for i, future in enumerate(as_completed(futures), 1):
-                chunk_id, active_df, deactivated_df, count, timing_info = future.result()
+        
+        num_workers = self.workers.get('phase1', MAX_WORKERS)
+        
+        if num_workers > 1:
+            logger.info(f"  Processing {len(chunk_ids)} chunks in parallel (max {num_workers} workers)...")
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(process_chunk_phase1, args): args[0] for args in args_list}
+                
+                for i, future in enumerate(as_completed(futures), 1):
+                    chunk_id, active_df, deactivated_df, count, timing_info, duration = future.result()
+                    all_timing_info.extend(timing_info)
+                    
+                    # Save active shortcuts to cell table
+                    if active_df is not None and len(active_df) > 0:
+                        self.con.execute(f"CREATE OR REPLACE TABLE cell_{chunk_id} AS SELECT * FROM active_df")
+                        res_partition_cells.append(chunk_id)
+                    
+                    # Save deactivated shortcuts to forward_deactivated_table
+                    if deactivated_df is not None and len(deactivated_df) > 0:
+                        self.con.execute(f"""
+                            INSERT INTO {self.forward_deactivated_table}
+                            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+                            FROM deactivated_df
+                        """)
+                        total_deactivated += len(deactivated_df)
+                    
+                    logger.info(f"  [{i}/{len(chunk_ids)}] Chunk {chunk_id} complete in {duration:.2f}s. {count} active, {len(deactivated_df) if deactivated_df is not None else 0} deactivated")
+        else:
+            logger.info(f"  Processing {len(chunk_ids)} chunks sequentially...")
+            for i, args in enumerate(args_list, 1):
+                chunk_id, active_df, deactivated_df, count, timing_info, duration = process_chunk_phase1(args)
                 all_timing_info.extend(timing_info)
                 
-                # Save active shortcuts to cell table
                 if active_df is not None and len(active_df) > 0:
                     self.con.execute(f"CREATE OR REPLACE TABLE cell_{chunk_id} AS SELECT * FROM active_df")
                     res_partition_cells.append(chunk_id)
                 
-                # Save deactivated shortcuts to forward_deactivated_table
                 if deactivated_df is not None and len(deactivated_df) > 0:
                     self.con.execute(f"""
                         INSERT INTO {self.forward_deactivated_table}
@@ -593,7 +782,7 @@ class ParallelShortcutProcessor:
                     """)
                     total_deactivated += len(deactivated_df)
                 
-                logger.info(f"  [{i}/{len(chunk_ids)}] Chunk {chunk_id} complete. {count} active, {len(deactivated_df) if deactivated_df is not None else 0} deactivated")
+                logger.info(f"  [{i}/{len(chunk_ids)}] Chunk {chunk_id} complete in {duration:.2f}s. {count} active, {len(deactivated_df) if deactivated_df is not None else 0} deactivated")
         
         # Log PURE vs SCIPY timing summary
         if all_timing_info:
@@ -720,32 +909,49 @@ class ParallelShortcutProcessor:
         Workers use in-memory DBs with data passed as DataFrames.
         """
         log_conf.log_section(logger, f"PHASE 4: PARALLEL BACKWARD ({self.partition_res} -> 15)")
-        
-        cell_ids = self.current_cells
-        total_shortcuts = sum(
-            self.con.execute(f"SELECT count(*) FROM cell_{cell_id}").fetchone()[0] 
-            for cell_id in cell_ids
-        )
-        logger.info(f"  Starting with {len(cell_ids)} cells ({total_shortcuts} shortcuts), max {MAX_WORKERS} workers...")
-        
         # Load edges once - shared by all workers
         edges_df = self.con.execute("SELECT * FROM edges").df()
         
         # Prepare args - each worker gets edges + cell data
         args_list = []
+        total_shortcuts = 0
+        cell_ids = self.current_cells
         for cell_id in cell_ids:
             cell_df = self.con.execute(f"SELECT * FROM cell_{cell_id}").df()
             if len(cell_df) > 0:
                 args_list.append((cell_id, edges_df, cell_df, self.partition_res, self.sp_method, self.hybrid_res))
+                total_shortcuts += len(cell_df)
         
         total_deactivated = self.con.execute(f"SELECT count(*) FROM {self.backward_deactivated_table}").fetchone()[0]
-        
         all_timing_info = []  # Collect timing from all workers
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_chunk_phase4, args): args[0] for args in args_list}
-            
-            for i, future in enumerate(as_completed(futures), 1):
-                cell_id, result_df, count, timing_info = future.result()
+        
+        num_workers = self.workers.get('phase4', MAX_WORKERS)
+        
+        if num_workers > 1:
+            logger.info(f"  Starting with {len(cell_ids)} cells ({total_shortcuts} shortcuts), max {num_workers} workers...")
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(process_chunk_phase4, args): args[0] for args in args_list}
+                
+                for i, future in enumerate(as_completed(futures), 1):
+                    cell_id, result_df, count, timing_info, duration = future.result()
+                    all_timing_info.extend(timing_info)
+                    
+                    if result_df is not None and len(result_df) > 0:
+                        # Insert into backward_deactivated
+                        self.con.execute(f"""
+                            INSERT INTO {self.backward_deactivated_table}
+                            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
+                            FROM result_df
+                        """)
+                        total_deactivated += count
+                    
+                    # Drop cell table
+                    self.con.execute(f"DROP TABLE IF EXISTS cell_{cell_id}")
+                    logger.info(f"  [{i}/{len(cell_ids)}] Cell {cell_id} complete in {duration:.2f}s: {count} shortcuts, total: {total_deactivated}")
+        else:
+            logger.info(f"  Starting with {len(cell_ids)} cells ({total_shortcuts} shortcuts) sequentially...")
+            for i, args in enumerate(args_list, 1):
+                cell_id, result_df, count, timing_info, duration = process_chunk_phase4(args)
                 all_timing_info.extend(timing_info)
                 
                 if result_df is not None and len(result_df) > 0:
@@ -759,7 +965,7 @@ class ParallelShortcutProcessor:
                 
                 # Drop cell table
                 self.con.execute(f"DROP TABLE IF EXISTS cell_{cell_id}")
-                logger.info(f"  [{i}/{len(cell_ids)}] Cell {cell_id}: {count} shortcuts, total: {total_deactivated}")
+                logger.info(f"  [{i}/{len(cell_ids)}] Cell {cell_id} complete in {duration:.2f}s: {count} shortcuts, total: {total_deactivated}")
         
         # Log PURE vs SCIPY timing summary
         if all_timing_info:
@@ -902,76 +1108,24 @@ class ParallelShortcutProcessor:
         self.con.execute(f"ALTER TABLE {input_table}_tmp RENAME TO {input_table}")
         self.con.execute("DROP TABLE IF EXISTS _child_cells")
 
-    def process_cell_forward(self, table_name: str, method: str = SP_METHOD):
+    def process_cell_forward(self, table_name: str, method: str = SP_METHOD, num_workers: int = 1):
         """
         Processes shortcuts for forward pass with deactivation.
         Expands current_cell_in/out to single current_cell column first.
         """
-        # Step 1: Expand from current_cell_in/out to current_cell
-        self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-        self.con.execute(f"""
-            CREATE TABLE {table_name}_expanded AS
-            -- Inner cell (always include if not null)
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, current_cell_in AS current_cell
-            FROM {table_name}
-            WHERE current_cell_in IS NOT NULL
-            UNION
-            -- Outer cell (only if different from inner)
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, current_cell_out AS current_cell
-            FROM {table_name}
-            WHERE current_cell_out IS NOT NULL 
-              AND (current_cell_in IS NULL OR current_cell_out != current_cell_in)
-            UNION ALL
-            -- Inactive (both NULL)
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, 
-                   inner_res, outer_res, NULL AS current_cell
-            FROM {table_name}
-            WHERE current_cell_in IS NULL AND current_cell_out IS NULL
-        """)
+        active, news, decs = _process_cell_forward_worker(self.con, table_name, method=method, num_workers=num_workers)
         
-        # Step 2: Separate active and deactivated
-        self.con.execute(f"DROP TABLE IF EXISTS shortcuts_to_process")
-        self.con.execute(f"CREATE TEMPORARY TABLE shortcuts_to_process AS SELECT * FROM {table_name}_expanded WHERE current_cell IS NOT NULL")
-        
-        self.con.execute(f"""
-            INSERT INTO {self.forward_deactivated_table}
-            SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
-            FROM {table_name}_expanded WHERE current_cell IS NULL
-        """)
-        deactivated_count = self.con.sql(f"SELECT count(*) FROM {table_name}_expanded WHERE current_cell IS NULL").fetchone()[0]
-        
-        active_count = self.con.sql("SELECT count(*) FROM shortcuts_to_process").fetchone()[0]
-        
-        new_count = 0
-        if active_count > 0:
-            self.run_shortest_paths(method=method, quiet=True, input_table="shortcuts_to_process")
-            self.con.execute(f"DROP TABLE {table_name}")
-            self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-            # Select only base columns (drop current_cell)
+        # Insert deactivated shortcuts into forward_deactivated_table
+        # The worker creates a 'deactivated' table with the inactive shortcuts
+        if decs > 0:
             self.con.execute(f"""
-                CREATE TABLE {table_name} AS
+                INSERT INTO {self.forward_deactivated_table}
                 SELECT from_edge, to_edge, cost, via_edge, lca_res, inner_cell, outer_cell, inner_res, outer_res
-                FROM shortcuts_to_process
+                FROM deactivated
             """)
-            new_count = self.con.sql(f"SELECT count(*) FROM {table_name}").fetchone()[0]
-        else:
-            self.con.execute(f"DROP TABLE {table_name}")
-            self.con.execute(f"DROP TABLE IF EXISTS {table_name}_expanded")
-            self.con.execute(f"""
-                CREATE TABLE {table_name} (
-                    from_edge BIGINT, to_edge BIGINT, cost DOUBLE, via_edge BIGINT,
-                    lca_res INTEGER, inner_cell BIGINT, outer_cell BIGINT, 
-                    inner_res TINYINT, outer_res TINYINT
-                )
-            """)
-            new_count = 0
-            
-        self.con.execute("DROP TABLE IF EXISTS shortcuts_to_process")
-        self.con.execute("DROP TABLE IF EXISTS shortcuts_next")
+        self.con.execute("DROP TABLE IF EXISTS deactivated")
         
-        return active_count, new_count, deactivated_count
+        return active, news, decs
 
     def process_cell_backward(self, table_name: str, method: str = SP_METHOD):
         """

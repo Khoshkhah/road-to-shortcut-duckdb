@@ -62,19 +62,23 @@ Combines both algorithms based on resolution:
 **Pros**: Best of both worlds
 **Cons**: More complex orchestration
 
-### 4. Partitioned (`generate_shortcuts_partitioned.py`)
+### 4. Partitioned (`main.py` with `processor_parallel.py`)
 
-Memory-efficient 4-phase approach:
+Memory-efficient 4-phase approach with optional parallelism:
 
-| Phase | Direction | Resolution Range | Strategy |
-|-------|-----------|------------------|----------|
-| 1 | Forward | 15 → 7 | Partition by Res-7 cells |
-| 2 | Forward | 6 → -1 | Hierarchical aggregation |
-| 3 | Backward | 0 → 6 | Hierarchical expansion |
-| 4 | Backward | 7 → 15 | Partition by Res-7 cells |
+| Phase | Direction | Resolution Range | Strategy | Parallel |
+|-------|-----------|------------------|----------|----------|
+| 1 | Forward | 15 → partition_res | Partition by cells | ✅ Yes |
+| 2 | Forward | partition_res-1 → 0 | Hierarchical aggregation | Sequential |
+| 3 | Backward | 0 → partition_res-1 | Hierarchical expansion | Sequential |
+| 4 | Backward | partition_res → 15 | Process cells individually | ✅ Yes |
 
-**Pros**: Constant memory usage regardless of dataset size
-**Cons**: More complex, slight overhead from partitioning
+**Parallel Phases (1 & 4)**: Each cell processed independently in separate workers using in-memory DuckDB instances. Data passed as DataFrames.
+
+**Sequential Phases (2 & 3)**: Parent cells depend on children, so processed hierarchically. Uses SCIPY or PURE internally based on `hybrid_res`.
+
+**Pros**: Constant memory per worker, scales to any dataset size
+**Cons**: More complex orchestration
 
 ## Complexity Analysis
 

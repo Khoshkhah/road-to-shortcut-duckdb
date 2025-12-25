@@ -21,11 +21,11 @@ algorithm:
 
 # Parallel Execution
 parallel:
-  workers: 1           # 1 = single-threaded, >1 = parallel with N workers
+  workers: 10          # 1 = single-threaded, >1 = parallel with N workers
 
 # DuckDB Configuration
 duckdb:
-  memory_limit: "12GB"
+  memory_limit: "16GB"
   threads: null        # null = auto-detect
   fresh_start: true   # If true, delete existing DB before running
 

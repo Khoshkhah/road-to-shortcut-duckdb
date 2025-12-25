@@ -50,11 +50,8 @@ def run_algorithm(cfg):
     
     # Import and run the appropriate algorithm
     if algo_name == "partitioned":
-        if workers > 1:
-            # Parallel execution
-            run_partitioned_parallel(cfg)
-        else:
-            run_partitioned_single(cfg)
+        # The parallel implementation now handles workers=1 correctly
+        run_partitioned_parallel(cfg)
     
     elif algo_name in ["hybrid", "scipy", "pure"]:
         print(f"Note: '{algo_name}' is deprecated. Use 'partitioned' with sp_method setting.")
@@ -78,71 +75,6 @@ def format_time(seconds: float) -> str:
     return f"{minutes}m{secs}s"
 
 
-def run_partitioned_single(cfg):
-    """Run partitioned algorithm in single-threaded mode."""
-    import logging
-    import logging_config as log_conf
-    import utilities as utils
-    from processor import ShortcutProcessor
-    
-    logger = logging.getLogger(__name__)
-    log_conf.setup_logging(f"single_{cfg.input.district}", level=cfg.logging.level, verbose=cfg.logging.verbose)
-    
-    # Log config info at start
-    log_conf.log_section(logger, "CONFIGURATION")
-    logger.info(f"District: {cfg.input.district}")
-    logger.info(f"Edges: {cfg.input.edges_file}")
-    logger.info(f"Graph: {cfg.input.graph_file}")
-    logger.info(f"Output: {cfg.output.directory}/{cfg.output.shortcuts_file}")
-    logger.info(f"SP Method: {cfg.algorithm.sp_method}")
-    if cfg.algorithm.sp_method == "HYBRID":
-        logger.info(f"Hybrid Res: {cfg.algorithm.hybrid_res} (PURE for res >= {cfg.algorithm.hybrid_res}, SCIPY for res < {cfg.algorithm.hybrid_res})")
-    logger.info(f"Partition Res: {cfg.algorithm.partition_res}")
-    logger.info(f"Workers: {cfg.parallel.workers}")
-    logger.info(f"DuckDB Memory: {cfg.duckdb.memory_limit}")
-    
-    # Setup paths
-    persist_dir = Path(cfg.output.persist_dir)
-    persist_dir.mkdir(parents=True, exist_ok=True)
-    db_path = str(persist_dir / f"{cfg.input.district}_partitioned.db")
-    
-    # Delete existing DB if fresh_start is enabled
-    if cfg.duckdb.fresh_start:
-        import glob
-        for f in glob.glob(f"{db_path}*"):
-            Path(f).unlink()
-            logger.info(f"Deleted: {f}")
-    
-    output_dir = Path(cfg.output.directory)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize DuckDB and load data
-    print(f"Database: {db_path}")
-    
-    # Create processor with config parameters
-    processor = ShortcutProcessor(
-        db_path=db_path,
-        forward_deactivated_table="deactivated_shortcuts",
-        backward_deactivated_table="backward_deactivated",
-        partition_res=cfg.algorithm.partition_res,
-        elementary_table="elementary_shortcuts",
-        sp_method=cfg.algorithm.sp_method,
-        hybrid_res=cfg.algorithm.hybrid_res
-    )
-    
-    # Load shared data (edges and graph)
-    processor.load_shared_data(cfg.input.edges_file, cfg.input.graph_file)
-    
-    # Run the phases
-    processor.process_forward_phase1()
-    processor.process_forward_phase2_consolidation()
-    processor.process_backward_phase3_consolidation()
-    processor.process_backward_phase4_chunked()
-    
-    # Finalize and save output
-    output_file = str(output_dir / cfg.output.shortcuts_file)
-    processor.finalize_and_save(output_file)
-    print(f"Saved shortcuts to: {output_file}")
 
 
 def run_partitioned_parallel(cfg):
@@ -192,6 +124,14 @@ def run_partitioned_parallel(cfg):
     
     total_start = time.time()
     
+    # Prepare worker configuration
+    worker_config = {
+        'phase1': getattr(cfg.parallel, 'workers_phase1', cfg.parallel.workers),
+        'phase2': getattr(cfg.parallel, 'workers_phase2', cfg.parallel.workers),
+        'phase3': getattr(cfg.parallel, 'workers_phase3', cfg.parallel.workers),
+        'phase4': getattr(cfg.parallel, 'workers_phase4', cfg.parallel.workers),
+    }
+    
     # Create parallel processor
     processor = ParallelShortcutProcessor(
         db_path=db_path,
@@ -200,7 +140,8 @@ def run_partitioned_parallel(cfg):
         partition_res=cfg.algorithm.partition_res,
         elementary_table="elementary_shortcuts",
         sp_method=cfg.algorithm.sp_method,
-        hybrid_res=cfg.algorithm.hybrid_res
+        hybrid_res=cfg.algorithm.hybrid_res,
+        worker_config=worker_config
     )
     
     # Load shared data
